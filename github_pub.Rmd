@@ -1,0 +1,2951 @@
+---
+title: "Seurat - modified"
+output:
+  html_document:
+    theme: united
+    df_print: kable
+date: 'Compiled: `r format(Sys.Date(), "%B %d, %Y")`'
+---
+
+```{r rmd setup, include=FALSE}
+knitr::opts_chunk$set(
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 120),
+  message = FALSE,
+  warning = FALSE
+) 
+```
+
+```{r seurat object setup}
+library(Seurat)
+library(patchwork)
+library(dplyr)
+library(RColorBrewer)
+library(DESeq2)
+library(ggplot2)
+library(ggrepel)
+library(cowplot)
+library(tidyverse) 
+
+# change work directory
+CtxMg_23gw.data <- Read10X(data.dir ="/Users/jiapei/Desktop/single_cell_analysis/23gw/GeMg/filtered_feature_bc_matrix_GeMg_23gw/")
+GeMg_23gw.data <- Read10X(data.dir ="/Users/jiapei/Desktop/single_cell_analysis/23gw/CtxMg/filtered_feature_bc_matrix_CtxMg_23gw/")
+
+# Import scrublet (doublet detection package: https://github.com/swolock/scrublet), optional
+CtxMg_23gw <- CreateSeuratObject(counts = CtxMg_23gw.data, project = "CtxMg_23gw", min.cells = 3, min.features = 200)
+GeMg_23gw <- CreateSeuratObject(counts = GeMg_23gw.data, project = "GeMg_23gw", min.cells = 3, min.features = 200)
+
+# Merge GE and CTX datasets
+object <- merge(x = CtxMg_23gw, y = GeMg_23gw, merge.data = T, project = "object")
+object
+object[["percent.mt"]] <- PercentageFeatureSet(object = object, pattern = "^MT-")
+object[["percent.rb"]] <- PercentageFeatureSet(object = object, pattern = "^RP[SL]")
+head(x = object@meta.data, 5) # check metadata
+
+wd <- "/Users/jiapei/Desktop/single_cell_analysis/github_pub" #change to the directory in which you want to save your data/graphs
+
+setwd(wd)
+# Save Seurat object locally
+saveRDS(object, file = "object.rds")
+```
+
+```{r QC plots, Filter, anchor, pca}
+setwd(wd)
+# Plot QC
+tiff("qcViolinPlot.tiff", width=1000, height=500, res=120)
+VlnPlot(object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rb"), ncol = 4)
+
+tiff("qcFeaturePlot.tiff", width=1500, height=500, res=120)
+plot1 <- FeatureScatter(object, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") 
+plot2 <- FeatureScatter(object, feature1 = "nCount_RNA", feature2 = "percent.mt") 
+plot3 <- FeatureScatter(object, feature1 = "percent.rb", feature2 = "percent.mt") 
+CombinePlots(plots = list(plot1,plot2,plot3), ncol = 3)
+dev.off()
+
+# Based on QC data, filter Seurat object accordingly
+object <- subset(x = object, subset = nFeature_RNA < 6000 & nCount_RNA < 30000 & percent.mt < 5)
+object #check how many cells are left
+
+# Additional filtering: only keep features (genes) that have >1 count in >5 cells, to save time in downstream analysis
+mincounts<- 1
+mincells <- 5
+IsFeatureExpressed <- rowSums(as.matrix(object[["RNA"]]@counts >= mincounts)) >= mincells
+ExpressedFeatures <- rownames(object)[IsFeatureExpressed]
+object <- subset(x = object, features = ExpressedFeatures)
+object
+
+## The following steps use SCTransform 
+## SCTransform combines NormalizeData, FindVariableFeatures, ScaleData. Results are saved in a new assay (can be custom named) with counts being (corrected) counts, data being log1p(counts), scale.data being pearson residuals; sctransform::vst intermediate results are saved in misc slot of this new assay.
+# Step 1: Split object into a list of seurat objects
+obj.list <- SplitObject(object, split.by = "orig.ident")
+# Step 2: Normalize and identify variable features for each dataset independently
+obj.list <- lapply(X = obj.list, FUN = SCTransform)
+features <- SelectIntegrationFeatures(object.list = obj.list, nfeatures = 2000)
+obj.list <- PrepSCTIntegration(object.list = obj.list, anchor.features = features)
+# Step 3: Select features that are repeatedly variable across datasets for integration; define integration anchors
+anchors <- FindIntegrationAnchors(object.list = obj.list, normalization.method = "SCT", anchor.features = features)
+combined.sct <- IntegrateData(anchorset = anchors, normalization.method = "SCT") 
+# Step 4: Note that the original unmodified data still resides in the 'RNA' assay
+DefaultAssay(combined.sct) <- "integrated"
+# Step 5: Run the standard workflow for visualization and clustering
+combined.sct <- RunPCA(combined.sct)
+
+setwd(wd)
+tiff("ElbowPlot.tiff", width=600, height=600, res=120)
+ElbowPlot(object = combined.sct)
+dev.off()
+
+# Test different PCA # and resolution combos 
+object <- combined.sct
+DefaultAssay(object) <- "integrated"
+object <- FindNeighbors(object, reduction = "pca", dims = 1:30) # try k.param ~1% of cell number
+object <- FindClusters(object, resolution = 0.28)
+head(x = Idents(object), 5)
+
+object <- RunUMAP(object, reduction = "pca", dims = 1:30) #higher # of PCs form clearer cluster definitions
+#combined.sct <- RunTSNE(combined.sct, reduction = "pca", dims = 1:15)
+DimPlot(object, reduction = "umap")
+
+# Save object!!
+setwd(wd)
+saveRDS(object, file = "Mg_ctrl_sample.rds")
+
+# UMAP
+setwd(wd)
+tiff("umap_PC30_res028_1.tiff", width=2000, height=1000, res=120)
+p1 <- DimPlot(object, reduction = "umap", group.by = "orig.ident") 
+p2 <- DimPlot(object, reduction = "umap", label = TRUE, repel = TRUE)
+p1 + p2
+tiff("umap_PC30_res028_2.tiff", width=4000, height=1000, res=120)
+DimPlot(object, reduction = "umap", split.by = "orig.ident")
+dev.off()
+
+# UMAP: QC
+setwd(wd)
+tiff("umap_nCount_legend.tiff", width=600, height=600, res=120)
+FeaturePlot(object, reduction = 'umap', features = "nCount_RNA") & NoAxes() #& NoLegend()
+tiff("umap_nFeature_legend.tiff", width=600, height=600, res=120)
+FeaturePlot(object, reduction = 'umap', features = "nFeature_RNA") & NoAxes() #& NoLegend()
+#tiff("umap_percentMt_legend.tiff", width=600, height=600, res=120)
+#FeaturePlot(object, reduction = 'umap', features = "percent.mt") & NoAxes() #& NoLegend()
+dev.off()
+
+scrublet_num <- as.integer(as.logical(object@meta.data$scrublet))
+object@meta.data$scrublet_num <- scrublet_num
+setwd(wd)
+tiff("umap_scrubletScore.tiff", width=600, height=600, res=120)
+FeaturePlot(object, reduction = 'umap', features = "scrublet_score") & NoAxes() & NoLegend()
+tiff("umap_scrublet.tiff", width=600, height=600, res=120)
+FeaturePlot(object, reduction = 'umap', features = "scrublet_num") & NoAxes() & NoLegend()
+dev.off()
+
+# tSNE
+setwd(wd)
+tiff("tsne_origID_1_PC6_res02_kparam125.tiff", width=2000, height=1000, res=120)
+p1 <- DimPlot(object, reduction = "tsne", group.by = "orig.ident")
+p2 <- DimPlot(object, reduction = "tsne", label = TRUE, repel = TRUE)
+p1 + p2
+dev.off()
+
+# PCA details
+print(x = object[['pca']], dims = 1:5, nfeatures = 5)
+
+setwd(wd)
+tiff("PC_loading.tiff", width=1000, height=1000, res=120)
+VizDimLoadings(object, dims = 1:2, reduction = 'pca')
+#tiff("PCA_plot.tiff", width=750, height=500, res=120)
+#DimPlot(object, reduction = 'pca')
+#tiff("PC1to6_heatmap.tiff", width=1000, height=1000, res=120)
+#DimHeatmap(object, dims = 1:6, cells = 500, balanced = T)
+dev.off()
+
+# calculate average reads and genes per cell
+## method 1 ##
+counts <- object@assays$RNA@counts # raw counts from Seurat object (after filtering)
+counts_per_cell <- Matrix::colSums(counts)
+print(mean(counts_per_cell)) # average reads per cell
+
+counts_per_gene <- Matrix::rowSums(counts)
+genes_per_cell <- Matrix::colSums(counts>0) # count gene only if it has non-zero reads mapped.
+print(mean(genes_per_cell)) # average genes per cell
+
+hist(log10(counts_per_cell+1),main='counts per cell',col='wheat')
+hist(log10(genes_per_cell+1), main='genes per cell', col='wheat')
+plot(counts_per_cell, genes_per_cell, log='xy', col='wheat')
+title('counts vs genes per cell')
+
+## method 2 ##
+mean(object@meta.data$nCount_RNA) # average reads per cell
+mean(object@meta.data$nFeature_RNA) # average genes per cell
+```
+
+```{r single dataset: SCTransform workflow}
+object_endo <- SCTransform(object_endo, vars.to.regress = "percent.mt", variable.features.n = 2000)
+object_endo <- RunPCA(object_endo) 
+
+# if SCTransform takes too long, try this:
+object <- NormalizeData(object = object, normalization.method = "LogNormalize", scale.factor = 1e4)
+object <- FindVariableFeatures(object = object,selection.method = 'vst', nfeatures = 2000)
+# Identify the 10 most highly variable genes
+top10 <- head(x = VariableFeatures(object = object), 10)
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(object = object)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+CombinePlots(plots = list(plot1, plot2))
+all.genes <- rownames(x = object)
+object <- ScaleData(object = object, features = all.genes)
+# if scaling is taking too long, try this:
+# default in `ScaleData` is only to perform scaling on the previously identified variable features (2,000 by default)
+object <- ScaleData(object = object)
+# to remove unwanted sources of variation from a single-cell dataset: we can 'regress out' heterogeneity associated with (for example) cell cycle stage, or mitochondrial contamination.
+object <- ScaleData(object = object, vars.to.regress = 'percent.mt')
+# perform linear dimentional reduction
+object <- RunPCA(object = object, features = VariableFeatures(object = object))
+```
+
+```{r integrate data / batch correction 3: age and region plots}
+object <- combined.sct
+colnames(x = object[[]])
+object@meta.data$age %>% table()
+
+temp <- object@meta.data$age
+temp[temp=="GW17"] <- "GW17_18"
+temp[temp=="GW18"] <- "GW17_18"
+temp[temp=="GW21"] <- "GW21_23"
+temp[temp=="GW23"] <- "GW21_23"
+object$age_group <- temp
+object@meta.data$age_group %>% table()
+
+#Endo <- subset(object, niche == "GeEndo" | niche == "CtxEndo")
+
+setwd(wd) # to be plotted after confirming cluster identities
+tiff("umap_CTX.tiff", width=400, height=400, res=120)
+DimPlot(object_CTX, reduction = "umap") + NoAxes() + scale_color_manual(values=colors) + NoLegend()
+dev.off()
+
+# Save object!
+setwd(wd)
+saveRDS(object, file = "Mg_ctrl_sample.rds")
+```
+
+```{r integrate data / batch correction 4: find marker genes}
+# For performing differential expression after integration, we switch back to the original data
+DefaultAssay(object) <- "RNA"
+
+markers <- FindAllMarkers(object, only.pos = T, min.pct = 0.5, logfc.threshold = 0.6) # find only positive markers
+setwd(wd)
+res <- markers %>% group_by(cluster) %>% top_n(n = 25, wt = avg_log2FC) #display top 25 genes in each cluster
+write.csv(res, file = "top25marker.csv", row.names = T)
+write.csv(markers, file = "markers.csv", row.names = T) # keep track of all DEGs
+
+## Run additional DE analysis to differentiate similar clusters ##
+test <- FindMarkers(object, ident.1 = "1 Homeostatic MG 1", ident.2 = "2 Homeostatic MG 2", min.pct = 0.5, logfc.threshold = 0.6)
+setwd(wd)
+write.csv(test, file = "1and2.csv", row.names = T)
+
+## test ##
+markers %>% group_by(cluster) %>% top_n(n = 12, wt = avg_log2FC) -> test
+VlnPlot(object, features = subset(test,cluster == "7 APCs")$gene) 
+
+# Plot marker genes in feature plot or violin plot
+DefaultAssay(object) <- "SCT" # use SCT assay for plotting
+
+top_selected <- c("P2RY12","AIF1","CCL2","GPNMB","MKI67","CLDN5","LYZ","HLA-DRA","STMN2","IL7R","MS4A1")
+
+setwd(wd) 
+tiff("FeatPlot_markers.tiff", width=1800, height=600, res=120)
+FeaturePlot(object, reduction = 'umap', features = top_selected, 
+            cols=c(adjustcolor("grey90", alpha.f = 0.2),"yellow","orange","red","darkred"), ncol = 6,
+            keep.scale = "all") & NoAxes() & NoLegend() #pt.size = 0.5
+#+ scale_colour_gradientn(colours = brewer.pal(n = 11, name = "YlOrRd"))
+dev.off()
+
+setwd(wd)
+tiff("VlnPlot_CD14.tiff", width=2000, height=1000, res=120)
+#Idents(object) <- "celltype"
+VlnPlot(object, features = c("FCGR1A"), pt.size = 0) & NoLegend() #same.y.lims = T, cols = colors, y.max = 8, cols = c("black","red"), split.by = "condition", ncol = 3
+dev.off()
+
+# Plot markers genes in dot plot or ridge plot
+setwd(wd)
+tiff("Dotplot_markers.tiff", width=1200, height=600, res=120)
+DotPlot(object, features = top_selected, dot.scale = 8, cols = c("blue", "red")) + RotatedAxis() # split.by = "age_label"
+#tiff("RidgePlot_marker.tiff", width=1200, height=600, res=120)
+#RidgePlot(object, feature = top_selected)
+dev.off()
+
+# Plot top marker genes as heatmap
+markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC) -> top5
+top <- c("CX3CR1","P2RY12","AIF1","C1QA","VSIG4",
+         "CCL2","CH25H","OTUD1","EGR2","NR4A2",
+         "SPP1","GPNMB","TREM2","APOC1","APOE",
+         "MKI67","TOP2A","CENPF","CDK1","AURKA",
+         "CLDN5","IGFBP7","ID3","ITM2A","MFSD2A",
+         "LYZ","S100A9","S100A12","JAML","ANXA1",
+         "HLA-DRB1","HLA-DRA","HLA-DPA1","HLA-DPB1","CD74",
+         "STMN2","TUBB2B","SOX4","NRXN1","DCX",
+         "IL7R","GIMAP7","CD3D","TRBC1","TRAC",
+         "MS4A1","IGLC1","IGHM","IGHD","IGLC2") 
+
+# the following if based on Kwok et al, Immunity 2020 Fig 3
+TF_monocyte <- c("IRF5","IRF8","KLF4","ZFYVE28","AHRR","GLI1","FOS","HOXA1","JUND","FOSL2","NFIL3","NRG1","JAG2","MEIS1","HOXA7",
+                 "ZMAT3","SOX12","SOX4","MAML2","MLLT6","SCML2","PRDM5","PPARGC1B","TCF7L2","ETV5","TRPS1","POU2F2","PIR","RARG",
+                 "FOSB","KLF2","JUN","IL31RA","GBX2","NOTCH4") #omitted: NOTCH4, GBX2, IL31RA, RARG, PIR, TRPS1, ETV5, PPARGC1B, PRDM5, SCML2, 
+                  #MLLT6, MAML2, ZMAT3, HOXA7, MEIS1, JAG2, NRG1, HOXA1, GLI1, AHRR, ZFYVE28, IRF5
+TF_neutrophil <- c("GFI1","CEBPE","PER3","JAG1","SOX13","KLF5","DACH1","ZEB1","ID2","ETS1","ELL2","HLF","ZBTB46","GFI1B","GATA1","KLF1",
+                   "TCF7L1","POU2AF1","PTGER3","BATF3") #omitted: BATF3, PTGER3, POU2AF1, TCF7L1, KLF1, GATA1, GFI1B, ZBTB46, HLF, ELL2, DACH1, 
+                  #KLF5, SOX13, CEBPE, GFI1
+TF_GMP <- c("HOXA9","IKZF2","EYA2","HDX","ZFP36L1","GATA2","HOXA10","CIITA","ZFP57") #omitted: ZFP57, CIITA, HOXA10, GATA2, HDX, EYA2, IKZF2, HOXA9
+# omission reason: not "varied" enough among cells/clusters
+TF_combine <- c("IRF5","IRF8","KLF4","ZFYVE28","AHRR","GLI1","FOS","HOXA1","JUND","FOSL2","NFIL3","NRG1","JAG2","MEIS1","HOXA7",
+                 "ZMAT3","SOX12","SOX4","MAML2","MLLT6","SCML2","PRDM5","PPARGC1B","TCF7L2","ETV5","TRPS1","POU2F2","PIR","RARG",
+                 "FOSB","KLF2","JUN","IL31RA","GBX2","NOTCH4","GFI1","CEBPE","PER3","JAG1","SOX13","KLF5","DACH1","ZEB1","ID2",
+                "ETS1","ELL2","HLF","ZBTB46","GFI1B","GATA1","KLF1","TCF7L1","POU2AF1","PTGER3","BATF3","HOXA9","IKZF2","EYA2","HDX","ZFP36L1",
+                "GATA2","HOXA10","CIITA","ZFP57")
+TF_combine_clean <- c("KLF4","FOSL2","NFIL3","ZFP36L1","TCF7L2","POU2F2","JUND","FOS","KLF2","FOSB","ID2","JUN",
+                      "IRF8","SOX12","SOX4","PER3","JAG1","ZEB1","ETS1")
+
+object_mo_neu <- subset(object, idents = c("5 Monocytes","9 Neutrophils"))
+object_mo_neu_ctrl <- subset(object_mo_neu, subset = condition == "CTRL")
+object <- subset(object_mo_neu, subset = condition == "GMH")
+
+setwd(wd)
+tiff("Heatmap_markers.tiff", width=1500, height=800, res=120)
+DoHeatmap(object, features = top, label = F, group.colors = colors)# + NoLegend() #group.colors = c("brown","yellow")
+dev.off()
+```
+
+```{r integrate data / batch correction 5: rename clusters}
+IDs <- c("1b Homeostatic MG 2","1a Homeostatic MG 1","1c CCL2+ MG","2 WM-assoc MG","3 Cell cycle MG","4 Vascul-assoc MG","5 Monocytes","6 HLA+ My","7 Neuron-assoc MG","8 T cells","9 B cells") 
+names(x = IDs) <- levels(x = object)
+object <- RenameIdents(object, IDs)
+object[["cell_type"]] <- Idents(object)
+new_level <- c("1a Homeostatic MG 1","1b Homeostatic MG 2","1c CCL2+ MG","2 WM-assoc MG","3 Cell cycle MG","4 Vascul-assoc MG","5 Monocytes","6 HLA+ My","7 Neuron-assoc MG","8 T cells","9 B cells")
+object@active.ident <- factor (x = object@active.ident, levels = new_level)
+
+# Set up cluster colors (check google sheet)
+colors <- c("blue","red","orange","forestgreen","cyan","grey50","darkorchid4","brown","magenta","yellow") #CCL2: bisque
+
+# Plot clusters with new names
+setwd(wd)
+tiff("umap_PC30_res028.tiff", width=600, height=600, res=120)
+DimPlot(object, reduction = "umap", label = F) + NoAxes() + NoLegend() + scale_color_manual(values=colors)
+tiff("umap_PC30_res028_legend.tiff", width=600, height=600, res=120)
+DimPlot(object, reduction = "umap") + NoAxes() + scale_color_manual(values=colors)
+dev.off()
+
+setwd(wd)
+tiff("umap_age.tiff", width=2000, height=500, res=120)
+DimPlot(object, reduction = "umap", split.by = "age") + NoAxes() + NoLegend() + scale_color_manual(values=colors)
+dev.off()
+```
+
+```{r integrate data / batch correction 6: DEGs}
+### DESeq2 ###
+object_new <- subset(x = object, subset = celltype == "5 Vascul-assoc MG") 
+Idents(object_new) <- "region" # parameter to run DESeq2 on
+object_new@active.ident %>% table()
+#object_subset <- subset(object, orig.ident != "9 Cytotoxic T and NK cells")
+#object_DEG <- object_subset
+object_new[["RNA"]]@counts <- as.matrix(object_new[["RNA"]]@counts)+1 #only use to debug error in following line
+DEG <- FindMarkers(object_new, ident.1 = "GE", ident.2 = "CTX", assay = "RNA", test.use = "DESeq2", max.cells.per.ident = 1000)
+# max.cells.per.ident default is Inf (no downsampling)
+# try test.use = "MAST" --> MAST produces a weird volcano plot
+
+setwd("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/previous/by_sample")
+write.csv(DEG, file = "GEvsCTX_VAM_DESeq2.csv", row.names = T)
+
+# order csv file by logFC; volcano plot:
+setwd(wd)
+DE_genes <- read.csv("GMHvsCTRL_DESeq2_mo.csv")
+#min_adj <- 0
+min_adj <- min(DE_genes$p_val_adj[DE_genes$p_val_adj > 0], na.rm = T); min_adj
+#DE_genes[is.na(DE_genes)] <- 0 # replace any NA values with 0
+for (row in 1:dim(DE_genes)[1])
+  {
+    DE_genes$p_val_adj[row] <- -log10(DE_genes$p_val_adj[row] + min_adj) #prevent log transform 0
+  }
+n <- 5
+genes.to.label.2 <- c(DE_genes$X[1:n], tail(DE_genes$X,n)) #extract first and last n DE genes (ranked by log2FC)
+genes.to.label <- c("CD14","RNASE1","C1QB","S100A9","GAPDH","CXCL16")
+label.index <- match(genes.to.label,DE_genes$X)
+#genes.to.label.2 <- c("CX3CR1","P2RY12","CCL2","OLR1","CH25H")
+label.index.2 <- match(genes.to.label.2,DE_genes$X) [6:10]
+  
+df <- data.frame(x = DE_genes$avg_log2FC, y = DE_genes$p_val_adj)
+f <- ggplot(df, aes(x,y)) + 
+  geom_point(colour = "black", size = 1) +
+  #geom_point(aes(colour = cut(DE_genes$p_val_adj, c(-Inf, 1.3, Inf)))) + # -log(0.05) = 1.30103
+  #scale_color_manual(name = "FDR cutoff (<0.05)", values = c("(-Inf,1.3]" = "black", "(1.3, Inf]" = "red"),
+  #labels = c(">= 0.05", "< 0.05")) +
+  scale_y_continuous(name = "-log10 Adjusted p-value", limits = c(0,300)) +
+  scale_x_continuous(name = "log2 Fold Change", limits = c(-4,4)) + 
+  geom_point(data = df[label.index,], aes(x,y), colour = "red", size = 2) +
+  geom_label_repel(data = df[label.index,], aes(x,y,label=DE_genes$X[label.index]), size = 3, color = "red") +
+  geom_point(data = df[label.index.2,], aes(x,y), colour = "blue", size = 2) +
+  geom_label_repel(data = df[label.index.2,], aes(x,y,label=DE_genes$X[label.index.2]), size = 3, color = "blue") +
+  theme(axis.text.x = element_text(size = 10), axis.text.y = element_text(size = 10),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black"))
+#f <- f + geom_hline(yintercept=1.3, linetype="dashed", color = "red")
+#f <- f + geom_label_repel(aes(label=ifelse(All_genes$log2FoldChange < -9, as.character(All_genes$symbol),'')),size = 3, color = "red")
+#f <- f + geom_label_repel(aes(label=ifelse(All_genes$log2FoldChange > 29, as.character(All_genes$symbol),'')),size = 3, color = "red")
+f
+
+setwd(wd)
+tiff("DESeq2_volcano_GMHvsCTRL_mo.tiff", width=700, height=700, res=120)
+f
+dev.off()
+
+library(EnhancedVolcano)
+EnhancedVolcano(DEGs, lab = rownames(DEGs), x = "avg_log2FC", y = "p_val", pCutoff = 1e-09, FCcutoff = 0.5, labSize = 5, 
+                legendPosition = "none", drawConnectors = F, title = "title")
+
+### avg count plot ###
+theme_set(theme_cowplot())
+
+object <- SetIdent(object, value = 'celltype')
+object_subset <- subset(object, celltype == "5 Vascul-assoc MG")
+avg_expr <- log1p(AverageExpression(object = object_subset)$RNA) # change accordingly
+avg_expr <- as.data.frame(avg_expr) #switch matrix into data frame
+avg_expr$gene <- rownames(avg_expr)
+avg_expr <- na.omit(avg_expr) #eliminate NaN rows
+
+avg_expr_1 <- avg_expr[avg_expr$CTX > 10,] #select high expr genes (to eliminate technical errors)
+avg_expr_1 <- avg_expr_1[avg_expr_1$CTX - avg_expr_1$GE > 30,] #select genes with higher expr in this subset
+avg_expr_2 <- avg_expr[avg_expr$GE > 10,]
+avg_expr_2 <- avg_expr_2[avg_expr_2$GE - avg_expr_2$CTX > 30,]
+
+genes.to.label.1 <- c("CCL4L2","CCL4","CCL3L1","SPP1","CCL3")#avg_expr_1$gene
+genes.to.label.2 <- c("HBG1","HBB","TMSB10") #avg_expr_2$gene
+label.index.1 <- match(genes.to.label.1,avg_expr$gene)
+label.index.2 <- match(genes.to.label.2,avg_expr$gene)
+label.index.avg.1 <- match(avg_expr_1$gene,avg_expr$gene)
+label.index.avg.2 <- match(avg_expr_2$gene,avg_expr$gene)
+
+p1 <- ggplot(avg_expr, aes(CTX, GE)) + geom_point() + 
+  geom_point(data = avg_expr[label.index.avg.1,], aes(CTX, GE), colour = "red", size = 2) +
+  geom_label_repel(data = avg_expr[label.index.1,], aes(CTX, GE, label=avg_expr$gene[label.index.1]), size = 3, color = "red") +
+  geom_point(data = avg_expr[label.index.avg.2,], aes(CTX, GE), colour = "red", size = 2) +
+  geom_label_repel(data = avg_expr[label.index.2,], aes(CTX, GE, label=avg_expr$gene[label.index.2]), size = 3, color = "red") +
+  scale_y_continuous(limits = c(0,700)) +
+  scale_x_continuous(limits = c(0,700))
+#p1 <- LabelPoints(plot = p1, points = genes.to.label, repel = T)
+p1
+
+setwd(wd)
+write.csv(avg_expr, file = "avg_expr_region_5.csv", row.names = T)  ## change accordingly
+
+setwd(wd)
+tiff("avgExpr_region_5.tiff", width=500, height=500, res=120)
+p1
+dev.off()
+
+# for loop to process DE genes in each cell type
+setwd(wd) 
+#levels(x = object)
+mg <- c(0,1,3,4,8,11)
+endo <- c(2,5,7,13,14,15)
+for (i in endo)
+{
+  test.markers <- FindMarkers(object, ident.1 = i, ident.2 = endo[!endo %in% i], min.pct = 0.25)
+  write.csv(test.markers, file = paste("MgEndo_sp_", i, ".csv", sep=""), row.names = T)
+}
+
+# Make violin plots in a loop
+gene_list <- list(E14, P4, E14_P4, peripheral, DAM, lr_candidates,lr_candidates_selected)
+names(gene_list) <- c("E14","P4","E14_P4","peripheral","DAM","lr_candidates","lr_candidates_selected")
+
+i <- 1
+for (list in gene_list){
+  setwd(wd)
+  tiff(paste("VlnPlot_",names(gene_list)[i],".tiff", sep=""), width=3000, height=ceiling(length(list)/3)*600, res=120)
+  print(VlnPlot(object, features = list))
+  dev.off()
+  i <- i+1
+}
+
+# find DE genes with roc (not very accurate)
+setwd(wd)
+Mg_23gw.markers_roc <- FindAllMarkers(object = object, logfc.threshold = 0.25, test.use = "roc", only.pos = TRUE)
+res_roc <- Mg_23gw.markers_roc %>% group_by(cluster) %>% top_n(n = 10, wt = myAUC) #display top 10 genes in each cluster
+write.csv(res_roc, file = "Mg_23gw_top10marker_roc.csv", row.names = T) #rank by ROC scores; not as accurate
+
+# Save object!
+setwd(wd)
+saveRDS(object, file = "scvelo_mg_sample.rds")
+```
+
+```{r integrate data / batch correction 7: VS other datasets}
+query <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/external_data/ChrisGlass_mg_12gw/Mg_12gw.rds")
+query_endo <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/18_23_endo/endo.rds")
+DefaultAssay(query_endo) <- "RNA"
+reference <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/by_sample/scvelo_mg_sample.rds")
+DefaultAssay(reference) <- "RNA"
+
+reference <- RunUMAP(reference, reduction = "pca", dims = 1:15, return.model = T)
+
+test <- ProjectUMAP(query = reference, query.reduction = "pca", reference = reference, reference.reduction = "pca", reduction.model = "umap")
+
+DimPlot(test, reduction = "ref.umap", group.by = "celltype")
+```
+
+```{r integrate data / batch correction 8: VS bulk seq}
+install.packages("readxl")
+library("readxl")
+HLA <- c("TRAF6","CD74","HLA-DPB1","HLA-DMB","HLA-DMA","LGMN","B2M","HLA-DQA2","HLA-DRB1","HLA-DQB1","CTSV","PIKFYVE","CTSE",
+         "F6UB75","HLA-DRB5","FCGR2B","HLA-DOA","CTSF","CTSD","HLA-DRB4","HLA-DQB2","HLA-DPA1","FCER1G","HLA-DOB","HLA-DRB4",
+         "HLA-DQA1","HLA-DRA","IFI30","DNM2","CTSL","CTSS","HLA-DRB3")
+edgeR_region <- read_excel("/Users/jiapei/Desktop/UCSF_BMS/bulkRNAseq/edgeR/results/ctxVSge/region_ctxVSge.xlsx")
+edgeR_GE_up_logFC <- subset(edgeR_region,logFC>0)
+edgeR_GE_up_logFC <- edgeR_GE_up_logFC$Symbol
+#edgeR_GE_up_filtered <- subset(edgeR_GE_up_logFC,FDR<0.05)$Symbol
+edgeR_GE_up_HLA <- intersect(edgeR_GE_up_logFC,HLA)
+
+edgeR_GE_up <- c("SOCS1","APCDD1","AZU1","CLIP4","FN1","CLEC14A","LGALS3BP","SOX18")
+DESeq2_GE_up <- c("MORN3","CLEC4C","HHLA1","CCDC81","S1PR3","SOX18","GZMA","ZNF16","PCP4","MSX1","CLEC14A","ZNF311","KIRREL1","PTGIR",
+                  "TIMP4","PRSS3","PRICKLE1","PCDHGC3","C20orf204","ADH1B","SSMEM1","IGIP","KLKB1","TMEM225","SLC6A9","RARRES2","PP2D1",
+                  "ZNF324B","CLEC12B","FAM228A","ATP1B4","KCNJ8","NCR3LG1","RGS7BP","C2CD4C","ZIC1","ACTL9","C8orf37","ZNF132","P2RY4",
+                  "CYP7A1","SUV39H1","IQCF2","IYD","NIM1K","RAMP3","PKDCC","DZIP1L","LGALS3BP","CYP4F11","TBXA2R","C22orf34","CPA3",
+                  "ETAA1","ELN","SUSD5","EHD1","GPR61","ASPHD2","EFNA4","CCN2","HORMAD1","CASTOR1","SOCS1","SPON1","NOB1","FOXS1","BEND5",
+                  "MSLN","ZNF484","TEF","GMPPA","BYSL","GUCY1A2","HFE","RCE1","LAMC1","CDA","MYC","ADAMTSL3","EGR4","SEMA4B","OCA2","DUSP4",
+                  "GIPC3","LSR","DGKB","GAREM2","STARD3","ZDHHC11B","LMF1","NKILA","MCAM","CRHBP","COL4A2","ZFP90","CPA6","CD34",
+                  "ZNF366","ZNF304","PLCL1","TLCD2","NATD1","EXD3","JAG2","KDR","DCUN1D5","NOTCH3","AMPD2","RASGEF1C","ATIC","SLC9B1",
+                  "CC2D2B","SLC27A5","FZR1","MFSD2A","MCC","DBP","CRY2","GDPGP1","SPINT1","IKZF4","COL5A2","PLEKHG1","ZNF468","PDE7B",
+                  "GORAB","HSD17B8","PPM1F","ZNF767P","PPP1R16A","ADGRL3","RBM42","LAMA5","CXXC5","PLEKHA8","BZW2","ABAT","SLC16A10",
+                  "DRG2","FGFR1","ACTN4","B3GAT3","PNMA1","GLTP","THBS3","ECE1","ETS1","MATK","GIMAP6","MTURN","DDR1","TEX14","FN1",
+                  "C12orf65","UBE4B","PAPSS2","SEPTIN9","SLC7A8","DCLRE1C","DROSHA","NFKBIE")
+edgeR_CTX_up <- c("APOBEC3B","PNLDC1","PCDH11Y","ZNF202","OASL","C16orf70","ORC5","WDR24","NEIL2","TCEANC","CPXM1","CDCA5","RHBDD1",
+                  "ARMC8","SPP1","GEN1","ZNF34","SLC25A13","FBXO16","TMEM138","VDAC3","NOM1","SIMC1","PCP4L1","FZD8","AZI2","SEC22B")
+DESeq2_CTX_up <- c("TRIM37","YEATS2","IMPDH2","GNPTAB","MXD1","FANCI","CPSF1","DCLK1","SOCS3","MAP1B","CRMP1","RASA2","ZC3H8","GEN1",
+                   "TCTN1","MPLKIP","GALNT6","NGDN","SUN1","ANAPC15","Corf89","BDH1","EFHC1","KHNYN","CAPRIN2","AP2A1","NCOA5","CXADR",
+                   "STEAP1B","DCUN1D","PRAM1","FBXO22","MTMR10","DPAGT1","MAP2K4","RBMS2","ACOT9","AAAS","PGRMC1","PPP1R8","RRM1",
+                   "TBL2","ACAD8","ZNF426","PBK","KNL1","TTC21A","POC1A","POMGNT2","RPP40","ZSCAN21","SULT4A1",
+                   "RWDD2B","MAPK4","PRR7","ASS1","TBX15","CETP","RMDN2","IGSF9","C7orf25","PCDHGA7","CTRB2")
+edgeR_1519_up <- c("CDC20","GMCL1","NIM1K","METTL7B","ACTR3B","VCX","TARS2","CCNG1","C3orf38","PTEN","ZNF567","TSC22D3","IQCB1","NCAPH",
+                   "ODF2","RMI2","SLC66A3","AZU1","INMT","CAPN7","GGT1","OLA1","VPS13B","PREB","DLEU7","C11orf1","HMBS","LYAR","DLD",
+                   "ECI1","TRIM31","ANGPTL1","SCCPDH","VWA5A","SNPH","PCDH11Y","PNLDC1","FBXL17","STX18","NUP93","GPR101","PAAF1",
+                   "FAM49B","HOXC8","COPS4","ALPK3","ETFDH","DERA","GSDME","GUSBP5","TIGD4","UBA3","MT1A","BRINP2","PDRG1","HMGN4",
+                   "ARMC10","C14orf177","ODF3","GMPR2","C1orf56","GID4","PDE2A","SMAGP","ZNF202","GEN1","RNASEH2B","MORF4L2","DHRS1",
+                   "PSMC2","ARHGAP29","SIMC1","SLC30A5","FERMT2","MKLN1","INTS10","SMC1A","SGO1","ABHD12","MUC1","NUDT16","SEC23B",
+                   "FGD3","CLTB","OR5K4","PCP4L1","ORC5","OASL","B4GALT3","CCDC90B","GCH1","TEX10","TPMT","ERG28","PIGF","CCT8ARSB",
+                   "C6orf47","NEFL","GRPEL1","TEX14","VPS25","KMT5C","FZD8","SIDT1","C8orf48","CCIN","ARMC8","DCUN1D5","TMEM138","WDR24",
+                   "DEFA4","H3C13","STX12","REXO1","ARMC1","TRPV2","ANKRD40CL","CD68","SERPINB7","CCDC190","TRIP10","RNF14","NDUFB6",
+                   "AKIRIN1","SPG21","PAQR8","PLSCR1","VCPKMT","SIGLEC14","HCG9","GLRX5","MGST2","CHEK1","TXNDC9","TCEANC","OR6K6","VEZF1",
+                   "RGS2","DIS3","MAMDC4","KLHDC8B","TNFRSF13C","PAIP2B","RRP7BP","SLX4IP","ELOVL3","SURF2","WASHC3","SEC22A","PAG1","PCMT1",
+                   "FUCA2","NEIL2","ARHGAP18","TIMM50","FBLN1","CDKN3","ATP6V1H","POLR2H","TRIM52","CRY2","CCDC130","TMSB4X","FBXO16","CPXM1",
+                   "FBXO2","APOBEC3B","BPIFB3","BPIFB1","ZNF449","SH3KBP1","RBBP4","LRIF1","TSPAN5","MDH1","UFC1","CAHM","RHBDD1","SDC2",
+                   "RGS1","MCC","ST6GAL2","SEC22B","ATOH7")
+edgeR_2123_up <- c("HAS1","IGFBP2","CCN2","STRA6","NEFL","APLNR","GLRB","CCN1","BCHE","TMEM204","CTHRC1","FN1","C4orf36","SOX18","GADD45A")
+
+common <- intersect(edgeR_GE_up_filtered,rownames(object)) # change accordingly
+#all(common %in% rownames(object)) # check that all genes are in the Seurat object
+object[["GE_up_bulk_HLA_edgeR"]] <- PercentageFeatureSet(object, features = common)
+object[["GE_up_bulk_edgeR_nofilter"]] <- PercentageFeatureSet(object, features = common)
+object[["GE_up_bulk_edgeR_filter"]] <- PercentageFeatureSet(object, features = common)
+object[["GE_up_bulk_edgeR"]] <- PercentageFeatureSet(object, features = common)
+object[["CTX_up_bulk_edgeR"]] <- PercentageFeatureSet(object, features = common)
+object[["X1519_up_bulk_edgeR"]] <- PercentageFeatureSet(object, features = common)
+object[["X2123_up_bulk_edgeR"]] <- PercentageFeatureSet(object, features = common)
+
+setwd(wd)
+tiff("UMAP_GE_up_bulk_filter_edgeR.tiff", width=700, height=600, res=120)
+FeaturePlot(object, reduction = 'umap', features = "GE_up_bulk_edgeR_filter", 
+            cols=c(adjustcolor("grey90", alpha.f = 0.2),"red","darkred","black")) & NoAxes() #& NoLegend() 
+tiff("VlnPlot_GE_up_bulk_filter_edgeR.tiff", width=600, height=600, res=120)
+VlnPlot(object,features = "GE_up_bulk_HLA_edgeR", cols = colors, pt.size = 0) & NoLegend() 
+dev.off()
+
+library(ggplot2)
+library(scales)
+library(ggnewscale)
+
+umapCoord <- as.data.frame(Embeddings(object[["umap"]]))
+GE_up <- object@meta.data$GE_up_bulk_HLA_edgeR
+GE_up_log <- log(GE_up + min(GE_up[GE_up > 0]))
+CTX_up <- object@meta.data$CTX_up_bulk_edgeR
+CTX_up_log <- log(CTX_up + min(CTX_up[CTX_up > 0]))
+GE_up_log %>% summary()
+CTX_up_log %>% summary()
+# Combine with original data and blended colours
+df_test <- cbind.data.frame(
+  setNames(umapCoord, c("x", "y")), GE_up, CTX_up,
+  colour = rgb(
+    rescale(GE_up_log),
+    0,
+    rescale(CTX_up_log)))
+
+for (i in 1:nrow(df_test)) {
+  if (df_test[i,]$GE_up < 0.8 & df_test[i,]$CTX_up < 12) {
+    df_test[i,]$colour <- rgb(211/255,211/255,211/255,0.05) # setting cells below certain threholds to transparent grey
+  }
+}
+
+setwd(wd)
+tiff("UMAP_region_bulk_edgeR.tiff", width=800, height=600, res=120)
+ggplot(df_test, aes(x, y, colour = colour)) +
+  geom_point() +
+  scale_colour_identity() +
+  new_scale_colour() + # shape = NA --> invisible layers
+  geom_point(aes(colour = GE_up_log), shape = NA) +
+  scale_colour_gradient(low = "black", high = "red") +
+  new_scale_colour() +
+  geom_point(aes(colour = CTX_up_log), shape = NA) +
+  scale_colour_gradient(low = "black", high = "blue") +
+  theme(axis.line=element_blank(),axis.text.x=element_blank(),axis.text.y=element_blank(),
+        axis.ticks=element_blank(),axis.title.x=element_blank(),axis.title.y=element_blank(),
+        panel.background=element_blank(),panel.border=element_blank(),
+        panel.grid.major=element_blank(),panel.grid.minor=element_blank(),plot.background=element_blank()) # keep graph background blank
+dev.off()
+
+# AddModuleScore (ref: https://github.com/satijalab/seurat/issues/3521)
+# does not perform as well as PercentageFeatureSet (see aboce)
+DefaultAssay(object) <- 'RNA'
+edgeR_GE_up_list <- list(edgeR_GE_up)
+object <- AddModuleScore(object = object, features = edgeR_2123_up_list, name = "edgeR_2123_up_ModScore")
+
+setwd(wd)
+tiff("UMAP_2123_up_bulk_edgeR_ModScore.tiff", width=700, height=600, res=120)
+FeaturePlot(object, reduction = 'umap', features = "edgeR_2123_up_ModScore1", 
+            cols=c(adjustcolor("grey90", alpha.f = 0.2),"red","darkred","black")) & NoAxes()
+dev.off()
+
+setwd(wd)
+saveRDS(object, file = "scvelo_mg_sample.rds")
+```
+
+```{r integrate data / batch correction 9: filter DEG files}
+DEG <- read_excel("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/by_sample/GEvsCTX_DESeq2.xlsx")
+DEG$p_val_adj <- as.numeric(DEG$p_val_adj) # in case column is recognized as character
+DEG_filter <- subset(DEG, p_val_adj < 0.05)
+
+library("xlsx")
+setwd(wd)
+write.xlsx(DEG_filter, "GEvsCTX_DESeq2_filter.xlsx", col.names = T, row.names = T)
+```
+
+```{r cell type composition plot}
+# cell type composition for each donor
+object <- combined.sct
+#object <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/17gw_mg_anchor/17_mg_anchor_SCT.rds")
+
+# Create a stacked percent barplot (by cell type)
+data <- data.frame(matrix(ncol=3, nrow=1, dimnames=list(NULL, c("Cell_type", "Freq", "Condition"))))
+for (cell_type_ID in levels(object@meta.data$celltype)) 
+{
+  meta_subset <- subset(object@meta.data, celltype == cell_type_ID) 
+  freq <- as.data.frame(table(meta_subset$orig.ident)) ## change accordingly
+  freq$perc <- freq$Freq / sum(freq$Freq)
+  for (var in freq$Var1)
+  {
+    data <- rbind(data, c(cell_type_ID, subset(freq,Var1==var)$perc, var))
+  }
+}
+data <- data[2:dim(data)[1],] #eliminate the first row (dummy row to make rbind work)
+data$Freq <- as.numeric(data$Freq)
+# make different levels for each cell subtype
+level_order <- data[['Cell_type']]
+level_order <- level_order[!duplicated(level_order)]
+
+setwd(wd)
+tiff("barplot_cellType_age.tiff", width=1000, height=600, res=120)
+ggplot(data, aes(fill = Condition, y = Freq, x = factor(Cell_type, level = level_order))) + 
+  geom_bar(position="stack", stat="identity") +
+  xlab("Cell subtypes") +
+  ylab("Age frequency") +
+  scale_x_discrete(breaks = level_order, labels = level_order) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_fill_discrete(name = "Sample", labels = c("17GW CTX","17GW GE"))
+dev.off()
+
+# Create a stacked percent barplot (by sample)
+#object <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/scvelo/by_sample/scvelo_mg_sample.rds")
+#object <- subset(x = object, subset = sample == "GW23_2")
+data <- data.frame(matrix(ncol=3, nrow=1, dimnames=list(NULL, c("Cell_type", "Freq", "Condition"))))
+for (parameter in c("CTX","GE")) ## change accordingly
+{
+  meta_subset <- subset(object@meta.data, region == parameter) ## change accordingly
+  freq <- as.data.frame(table(meta_subset$cell_type)) ## change parameter accordingly (e.g. to celltype)
+  freq$perc <- freq$Freq / sum(freq$Freq)
+  for (var in freq$Var1)
+  {
+    data <- rbind(data, c(var, subset(freq,Var1==var)$perc*100, parameter))
+  }
+}
+data <- data[2:dim(data)[1],] #eliminate the first row (dummy row to make rbind work)
+data$Freq <- as.numeric(data$Freq)
+
+#data$Condition2 <- data$Condition
+#data$Condition2[data$Condition2=="GeMg_23gw"] <- "CTRL" ## change accordingly
+#data$Condition2[data$Condition2=="GeMg_GMH_24gw"] <- "GMH" ## change accordingly
+level_order <- data[['Condition']]
+level_order <- level_order[!duplicated(level_order)]
+
+setwd(wd)
+write.csv(data, file = "barplot_region.csv", row.names = T)  ## change accordingly
+
+setwd(wd)
+tiff("barplot_HLA_region.tiff", width=500, height=650, res=120) ## change accordingly
+ggplot(data, aes(fill = factor(Cell_type), y = Freq, x = factor(Condition))) + # factor(Cell_type, levels=new_level)
+  geom_bar(position="fill", stat="identity") +
+  xlab("Condition") +
+  ylab("% cells in cluster") +
+  scale_x_discrete(breaks = level_order, labels = level_order) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10), axis.text.y = element_text(size = 10),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  guides(fill=guide_legend(title="Cluster")) +
+  scale_y_continuous(labels = scales::percent_format()) 
+  #scale_fill_manual(values=colors)
+dev.off()
+
+setwd(wd)
+tiff("barplot_cluster_condition.tiff", width=1000, height=600, res=120) ## change accordingly
+ggplot(data, aes(fill = factor(Condition), y = Freq, x = factor(Cell_type, levels=new_level))) +
+  geom_bar(position="dodge", stat="identity") +
+  xlab("Cell type") +
+  ylab("% cells in cluster") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 10), axis.text.y = element_text(size = 10),
+        panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(), axis.line = element_line(colour = "black")) +
+  guides(fill=guide_legend(title="Condition"))
+dev.off()
+
+## make scatterplot of cluster %
+setwd(wd)
+data <- read.csv(file = "barplot_region_scatterplot.csv")
+
+setwd(wd)
+tiff("scatterplot_cluster_region.tiff", width=400, height=400, res=120) ## change accordingly
+ggplot(data, aes(x=CTX, y=GE)) + geom_point() + geom_label(label=rownames(data)) + geom_abline(colour = "blue") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+dev.off()
+```
+
+```{r additional plots}
+# New things to try!  Note that plotting functions now return ggplot2 objects, so you can add themes, titles, and options
+FeaturePlot(object = object, features = c("AIF1", "CLDN5"), blend = TRUE)
+DimPlot(object = object) + DarkTheme()
+DimPlot(object = object) + labs(title = "23GW microglia and endothelial cells")
+
+# Plot with ggplot2
+plot_umap <- DimPlot(object = object, reduction = "umap", label = F, label.size = 4.5) + xlab("UMAP 1") + ylab("UMAP 2") + 
+  theme(axis.title = element_text(size = 18), legend.text = element_text(size = 18)) + 
+  guides(colour = guide_legend(override.aes = list(size = 10)))
+ggsave(filename = "/Users/jiapei/Desktop/single_cell_analysis/23gw/Mg_23gw_umap_ggplot.png", height = 7, width = 12, plot = plot_umap)
+
+plot_tsne <- DimPlot(object = object, reduction = "tsne", label = F, label.size = 4.5) + xlab("tSNE 1") + ylab("tSNE 2") + 
+  theme(axis.title = element_text(size = 18), legend.text = element_text(size = 18)) + 
+  guides(colour = guide_legend(override.aes = list(size = 10)))
+ggsave(filename = "/Users/jiapei/Desktop/single_cell_analysis/23gw/Mg_23gw_tsne_ggplot.png", height = 7, width = 12, plot = plot_tsne)
+```
+
+```{r export data}
+# Save raw counts (need to convert gene names to ensembl ID)
+#BiocManager::install("EnsDb.Hsapiens.v79")
+library(EnsDb.Hsapiens.v79)
+
+count_mtx <- as.matrix(GetAssayData(object = object, slot = "counts"))
+dim(count_mtx)
+count_mtx[1,1:5] 
+
+geneSymbols <-  rownames(count_mtx)
+rownames(count_mtx)[1:5]
+ensembl_ID <- ensembldb::select(EnsDb.Hsapiens.v79, keys= geneSymbols, keytype = "SYMBOL", columns = c("SYMBOL","GENEID"))
+#not all genes have matching ensembl IDs
+count_mtx_ensembl <- count_mtx[ensembl_ID$SYMBOL,]
+dim(count_mtx_ensembl)[1]==dim(ensembl_ID)[1] #should have same number of rows as length of ensembl_ID; return T
+rownames(count_mtx_ensembl)[1:5]==ensembl_ID$SYMBOL[1:5] #should return T
+count_mtx_ensembl <- cbind.data.frame(Gene = ensembl_ID$GENEID,count_mtx_ensembl) #add ensembl ID to the first column
+dim(count_mtx_ensembl) #should have 1 additional column than prev
+head(count_mtx_ensembl,3) #first 3 genes (matrix now turned into data frame)
+
+write.table(count_mtx_ensembl,'/Users/jiapei/Desktop/single_cell_analysis/18gw/Mg_18gw_counts_ensembl.txt', 
+            sep = '\t', row.names = F, col.names = T, quote = F)
+
+# Save raw counts (gene names)
+# as.matrix(GetAssayData(object = object, slot = "data"))[200:210,10:12] == as.matrix(GetAssayData(object = object, slot = "counts")) [200:210,10:12]
+endo <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/CTRL_endo/ctrl_endo.rds")
+mg <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/by_sample/scvelo_mg_sample.rds")
+object <- merge(x = endo, y = mg, merge.data = T, project = "MgEndo")
+object #check celltypes are what you expect
+
+setwd(wd)
+saveRDS(object,"MgEndo.rds")
+
+setwd(wd)
+count_raw <- as.matrix(GetAssayData(object_2023_GE, slot = "counts"))
+write.table(count_raw, 'raw_counts_2023_GE.txt', 
+            sep = '\t', row.names = T, col.names = T, quote = F) #raw count data (not transformed)
+
+setwd(wd)
+count_norm <- apply(count_raw, 2, function(x) (x/sum(x))*10000)
+write.table(count_norm, 'norm_counts.txt', 
+            sep = '\t', row.names = T, col.names = T, quote = F) #normalized data (rec by CellPhoneDB)
+
+setwd(wd)
+write.table(as.matrix(GetAssayData(object_2023_GE, slot = "data")), 'norm_counts_seurat_2023_GE.txt', 
+            sep = '\t', row.names = T, col.names = T, quote = F) #normalized data by Seurat
+
+# if you want to downsize number of cells in count mtx (subset by cell type first)
+object@meta.data$cluster %>% table()
+mono2 <- subset(x = object, subset = cluster == "mono2")
+count_raw_mono2 <- as.matrix(GetAssayData(mono2, slot = "counts"))
+count_norm_mono2 <- apply(count_raw_mono2, 2, function(x) (x/sum(x))*10000)
+
+subset <- sample(1:dim(count_norm_cd4)[2], 2000, replace = F)
+count_norm_cd4_subset <- count_norm_cd4[,subset]
+dim(count_norm_cd4_subset)
+
+setwd(wd)
+write.table(count_norm_cd4_subset, 'norm_counts_cd4.txt', sep = '\t', row.names = T, col.names = T, quote = F)
+
+# Save metadata table (with new Cluster IDs)
+colnames(x = object[[]])
+object[["celltype"]] <- Idents(object = object)
+head(x = object@meta.data, 5) #check whether new cell type names are added
+
+setwd(wd)
+write.table(object_2023_GE@meta.data, 'metadata_2023_GE.txt', sep = '\t', row.names = T, col.names = NA, quote = F)
+# downsize version
+#write.table(cd4@meta.data[subset,], 'metadata_cd4.txt', sep = '\t', row.names = T, col.names = NA, quote = F)
+
+# Save gene names
+gene_List <- rownames(object)
+setwd(wd)
+write.table(gene_List, 'features.tsv', sep = '\t', row.names = T, col.names = NA, quote = F)
+```
+
+```{r object interaction}
+#ref: https://satijalab.org/seurat/articles/essential_commands.html 
+library(tidyverse)
+
+## Explore ##
+
+colnames(x = object) %>% head() #cell names
+rownames(x = object) %>% head() #feature (gene) names
+ncol(x = object) #number of cells
+nrow(x = object) #number of genes
+# Get cell identity classes
+levels(x = object)
+Idents(object = object) %>% head()
+# Set identity classes to an existing column in meta data
+Idents(object = object) <- "orig.ident"
+# Rename identity classes
+object <- RenameIdents(object = object, `Endo-U` = "Endo-U1")
+levels(x = object)
+
+## Subset ##
+
+# Subset Seurat object based on identity class, also see ?SubsetData
+subset(x = object, idents = "Mg-U1")
+subset(x = object, idents = c("Mg-U1", "Mg-Prolif"), invert = TRUE)
+# Subset on the expression level of genes/features
+subset(x = object, subset = MS4A1 > 3)
+subset(x = object, subset = MS4A1 > 3 & PC1 > 5)
+subset(x = object, subset = MS4A1 > 3, idents = "B cells")
+# Subset on a value in the object meta data
+subset(x = object, subset = orig.ident == "Replicate1")
+# Downsample the number of cells per identity class
+subset(x = object, downsample = 100)
+
+## Access data ##
+
+# View metadata data frame, stored in object@meta.data
+object[[]] %>% head()
+# Retrieve specific values from the metadata
+object$nCount_RNA %>% head()
+object[[c("percent.mt", "nFeature_RNA")]] %>% head()
+# Add metadata, see ?AddMetaData
+region_label <- sample(x = c("g1", "g2"), size = ncol(x = pbmc), replace = TRUE)
+object$groups <- region_label
+# Retrieve or set data in an expression matrix ('counts', 'data', and 'scale.data')
+GetAssayData(object = object, slot = "counts")
+object <- SetAssayData(object = object, slot = "scale.data", new.data = new.data)
+# Get cell embeddings and feature loadings
+Embeddings(object = object, reduction = "pca") %>% head()
+Loadings(object = object, reduction = "pca") %>% head()
+#Loadings(object = object, reduction = "pca", projected = TRUE)
+# FetchData can pull anything from expression matrices, cell embeddings, or metadata
+FetchData(object = object, vars = c("PC_1", "percent.mt", "MS4A1")) %>% head()
+
+## Visualize ##
+
+# Scatter plot
+FeatureScatter(object = object, feature1 = "AIF1", feature2 = "PC_1")
+FeatureScatter(object = object, feature1 = "AIF1", feature2 = "CLDN5")
+FeatureScatter(object = object, feature1 = "AIF1", feature2 = "SPP1")
+# HoverLocator show extra data throught the `information` argument, designed to work smoothly with FetchData
+plot <- DimPlot(object = object) + NoLegend()
+HoverLocator(plot = plot, information = FetchData(object = object, vars = c("ident", "PC_1", "nFeature_RNA")))
+# FeatureLocator
+select.cells <- CellSelector(plot = plot)
+# Label points on a ggplot object
+LabelPoints(plot = plot, points = TopCells(object = object[["pca"]]), repel = TRUE)
+```
+
+```{r published data: Hammond 2019}
+library(dplyr)
+library(Seurat)
+library(readr)
+
+counts.B10 <- read.delim2("/Users/jiapei/Downloads/GSM3442006_E14_F_B10.dge.txt", row.names=1)
+object.B10 <- CreateSeuratObject(counts = counts.B10, project = "B10_F", min.cells = 5, min.features = 200)
+
+counts.B11 <- read.delim2("/Users/jiapei/Downloads/GSM3442007_E14_M_B11.dge.txt", row.names=1)
+object.B11 <- CreateSeuratObject(counts = counts.B11, project = "B11_M", min.cells = 5, min.features = 200)
+
+counts.B12 <- read.delim2("/Users/jiapei/Downloads/GSM3442008_E14_F_B12.dge.txt", row.names=1)
+object.B12 <- CreateSeuratObject(counts = counts.B12, project = "B12_F", min.cells = 5, min.features = 200)
+
+counts.C1 <- read.delim2("/Users/jiapei/Downloads/GSM3442009_E14_F_C1.dge.txt", row.names=1)
+object.C1 <- CreateSeuratObject(counts = counts.C1, project = "C1_F", min.cells = 5, min.features = 200)
+
+counts.B9 <- read.delim2("/Users/jiapei/Downloads/GSM3442010_E14_M_B9.dge.txt", row.names=1)
+object.B9 <- CreateSeuratObject(counts = counts.B9, project = "B9_M", min.cells = 5, min.features = 200)
+
+counts.B6 <- read.delim2("/Users/jiapei/Downloads/GSM3442011_E14_F_B6.dge.txt", row.names=1)
+object.B6 <- CreateSeuratObject(counts = counts.B6, project = "B6_F", min.cells = 5, min.features = 200)
+
+counts.B7 <- read.delim2("/Users/jiapei/Downloads/GSM3442012_E14_M_B7.dge.txt", row.names=1)
+object.B7 <- CreateSeuratObject(counts = counts.B7, project = "B7_M", min.cells = 5, min.features = 200)
+
+counts.B8 <- read.delim2("/Users/jiapei/Downloads/GSM3442013_E14_M_B8.dge.txt", row.names=1)
+object.B8 <- CreateSeuratObject(counts = counts.B8, project = "B8_M", min.cells = 5, min.features = 200)
+
+object.B10
+object.B11
+object.B12
+object.C1
+object.B9
+object.B6
+object.B7
+object.B8
+
+combine_Mg <- merge(x = object.B10, y = c(object.B11,object.B12,object.C1,object.B9,object.B6,object.B7,object.B8), 
+                    merge.data = T, project = "combine_Mg")
+combine_Mg
+object <- combine_Mg #assign object accordingly!
+object[["percent.mt"]] <- PercentageFeatureSet(object = object, pattern = "^mt.")
+head(x = object@meta.data, 5)
+
+wd <- "/Users/jiapei/Desktop/single_cell_analysis/hammond/"
+
+setwd(wd)
+tiff("qc.tiff", width=2000, height=1000, res=120)
+VlnPlot(object = object, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+dev.off()
+```
+
+```{r cellID}
+# ref: https://github.com/RausellLab/CelliD 
+# https://bioconductor.org/packages/devel/bioc/vignettes/CelliD/inst/doc/BioconductorVignette.html 
+if(!require("tidyverse")) install.packages("tidyverse")
+if(!require("ggpubr")) install.packages("ggpubr")
+BiocManager::install("CelliD")
+
+library(CelliD)
+library(tidyverse) # general purpose library for data handling
+library(ggpubr) #library for plotting
+
+# Input: RDS object (from Seurat)
+object <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/17_18_23_anchor_new/Mg_SCT.rds") #already normalized, filtered, batch-corr
+
+# Restricting to protein-coding genes
+data("HgProteinCodingGenes")
+object <- object[rownames(object) %in% HgProteinCodingGenes,]
+
+# Normalize and scale
+#object <- NormalizeData(object)
+#object <- ScaleData(object, features = rownames(object))
+
+# Multiple Correspondence Analysis (MCA)
+object <- RunMCA(object)
+
+wd <- "/Users/jiapei/Desktop/single_cell_analysis/17_18_23_anchor_new"
+setwd(wd)
+tiff("cellID_MCAplot.tiff", width=1200, height=1000, res=120)
+DimPlotMC(object, reduction = "mca")
+#DimPlotMC(object, reduction = "mca", group.by = "orig.ident", features = c("TMEM119", "CCL2"), as.text = T)
+dev.off()
+
+# Comparison: PCA
+object <- RunPCA(object, features = rownames(object))
+object <- RunUMAP(object, dims = 1:15)
+object <- RunTSNE(object, dims = 1:15)
+PCA  <- DimPlot(object, reduction = "pca")  + ggtitle("PCA") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+tSNE <- DimPlot(object, reduction = "tsne")+ ggtitle("tSNE") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+UMAP <- DimPlot(object, reduction = "umap") + ggtitle("UMAP") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+MCA <- DimPlot(object, reduction = "mca")  + ggtitle("MCA") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+
+setwd(wd)
+tiff("cellID_MCA_PCA.tiff", width=2000, height=1000, res=120)
+ggarrange(PCA, MCA, common.legend = T, legend = "top")
+tiff("cellID_tSNE_UMAP.tiff", width=2000, height=1000, res=120)
+ggarrange(tSNE, UMAP, common.legend = T, legend = "top")
+dev.off()
+
+# Cell type prediction using pre-established marker lists
+panglao <- read_tsv("https://panglaodb.se/markers/PanglaoDB_markers_27_Mar_2020.tsv.gz")
+
+# restricting the analysis to brain specific gene signatues
+panglao_blood <- panglao %>% filter(organ == "Blood")
+# restricting to human specific genes
+panglao_blood <- panglao_blood %>%  filter(str_detect(species,"Hs"))
+# converting dataframes into a list of vectors, which is the format needed as input for CelliD
+panglao_blood <- panglao_blood %>%  
+  group_by(`cell type`) %>%  
+  summarise(geneset = list(`official gene symbol`))
+blood_gs <- setNames(panglao_blood$geneset, panglao_blood$`cell type`)
+
+# restricting the analysis to brain specific gene signatues
+panglao_brain <- panglao %>% filter(organ == "Brain")
+# restricting to human specific genes
+panglao_brain <- panglao_brain %>%  filter(str_detect(species,"Hs"))
+# converting dataframes into a list of vectors, which is the format needed as input for CelliD
+panglao_brain <- panglao_brain %>%  
+  group_by(`cell type`) %>%  
+  summarise(geneset = list(`official gene symbol`))
+brain_gs <- setNames(panglao_brain$geneset, panglao_brain$`cell type`)
+
+#filter to get human specific genes
+panglao_all <- panglao %>%  filter(str_detect(species,"Hs"))
+# convert dataframes to a list of named vectors which is the format for CelliD input
+panglao_all <- panglao_all %>%  
+  group_by(`cell type`) %>%  
+  summarise(geneset = list(`official gene symbol`))
+all_gs <- setNames(panglao_all$geneset, panglao_all$`cell type`)
+#remove very short signatures
+all_gs <- all_gs[sapply(all_gs, length) >= 10]
+
+# Performing per-cell hypergeometric tests against the gene signature collection
+HGT_blood_gs <- RunCellHGT(object, pathways = blood_gs, dims = 1:50, n.features = 200)
+HGT_brain_gs <- RunCellHGT(object, pathways = brain_gs, dims = 1:50, n.features = 200)
+
+# For each cell, assess the signature with the lowest corrected p-value (max -log10 corrected p-value)
+blood_gs_prediction <- rownames(HGT_blood_gs)[apply(HGT_blood_gs, 2, which.max)]
+# For each cell, evaluate if the lowest p-value is significant
+blood_gs_prediction_signif <- ifelse(apply(HGT_blood_gs, 2, max)>2, yes = blood_gs_prediction, "unassigned")
+# Save cell type predictions as metadata within the Seurat object
+object$blood_gs_prediction <- blood_gs_prediction_signif
+
+# For each cell, assess the signature with the lowest corrected p-value (max -log10 corrected p-value)
+brain_gs_prediction <- rownames(HGT_brain_gs)[apply(HGT_brain_gs, 2, which.max)]
+# For each cell, evaluate if the lowest p-value is significant
+brain_gs_prediction_signif <- ifelse(apply(HGT_brain_gs, 2, max)>2, yes = brain_gs_prediction, "unassigned")
+# Save cell type predictions as metadata within the Seurat object
+object$brain_gs_prediction <- brain_gs_prediction_signif
+
+# Comparing the original labels with CelliD cell-type predictions based on pancreas-specific gene signatures
+OriginalPlot <- DimPlot(object, reduction = "umap", group.by = "celltype") + scale_color_manual(values=colors) +
+  theme(legend.text = element_text(size = 8), aspect.ratio = 1)
+
+setwd(wd)
+tiff("celltype_predict_panglao_blood.tiff", width=2000, height=1000, res=120)
+Predplot1 <- DimPlot(object, reduction = "umap", group.by = "blood_gs_prediction") + 
+  theme(legend.text = element_text(size = 10), aspect.ratio = 1)
+ggarrange(OriginalPlot, Predplot1, legend = "top")
+tiff("celltype_predict_panglao_brain.tiff", width=2000, height=1000, res=120)
+Predplot2 <- DimPlot(object, reduction = "umap", group.by = "brain_gs_prediction") + 
+  theme(legend.text = element_text(size = 10), aspect.ratio = 1)
+ggarrange(OriginalPlot, Predplot2, legend = "top")
+dev.off()
+
+# To evaluate all cell types
+HGT_all_gs <- RunCellHGT(object, pathways = all_gs, dims = 1:50)
+all_gs_prediction <- rownames(HGT_all_gs)[apply(HGT_all_gs, 2, which.max)]
+all_gs_prediction_signif <- ifelse(apply(HGT_all_gs, 2, max)>2, yes = all_gs_prediction, "unassigned")
+object$all_gs_prediction <- ifelse(all_gs_prediction_signif %in% c(names(blood_gs), "Platelets", "Erythoroid-like and erythroid precursor cells", "unassigned"), all_gs_prediction_signif,"other")
+
+DimPlot(object, group.by = "all_gs_prediction", reduction = "umap") + theme(legend.text = element_text(size = 10), aspect.ratio = 1)
+
+# Extracting per-cell gene signatures from my own dataset with CelliD(c)
+cell_gs <- GetCellGeneSet(object, dims = 1:50, n.features = 200)
+# Extracting per-group gene signatures from my own dataset with CelliD(g)
+group_gs <- GetGroupGeneSet(object, dims = 1:50, n.features = 200, group.by = "celltype")
+
+library('biomaRt')
+
+eggen44 <- temp_obj #start with i in 1 and comment out merge line
+for (i in 2:12) ##
+{
+  mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+  temp <- read.delim2(paste("/Users/jiapei/Desktop/single_cell_analysis/eggen/GSE141862_RAW/44_",i,".txt", sep="")) ##
+  gene <- temp$gene
+  
+  G_list <- getBM(filters= "ensembl_gene_id", attributes= c("ensembl_gene_id","hgnc_symbol"), values=gene, mart= mart)
+  temp <- merge(temp, G_list, by.x="gene", by.y="ensembl_gene_id")
+  temp <- temp[!duplicated(temp$hgnc_symbol),]
+  
+  dim2 <- dim(temp)[2]
+  temp2 <- temp[,-dim2]
+  temp2 <- temp2[,-1]
+  rownames(temp2) <- temp[,dim2]
+  temp2 <- temp2[!row.names(temp2)%in%c(""),] #for some reason, one of the row names is empty (throwing error in CreateSeuratObject)
+  
+  temp_obj <- CreateSeuratObject(counts = temp2, project = paste("eggen44_",i,sep=""), min.cells = 5) ##
+  eggen44 <- merge(x = eggen44, y = temp_obj, merge.data = T, project = "eggen44") ##
+}
+
+VlnPlot(eggen44, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2) ##
+eggen44@meta.data$orig.ident <- "eggen44" ##
+
+# merge all 20 samples and SCT!
+eggen <- merge(x = eggen05, y = c(eggen09,eggen18,eggen19,eggen20,eggen22,eggen23,eggen25,eggen26,eggen28,eggen29,eggen30,eggen31,eggen32,eggen34,eggen36,eggen37,eggen41,eggen42,eggen44), merge.data = T, project = "eggen")
+
+obj.list <- SplitObject(eggen, split.by = "orig.ident")
+obj.list <- lapply(X = obj.list, FUN = SCTransform)
+features <- SelectIntegrationFeatures(object.list = obj.list, nfeatures = 2000)
+obj.list <- PrepSCTIntegration(object.list = obj.list, anchor.features = features)
+anchors <- FindIntegrationAnchors(object.list = obj.list, normalization.method = "SCT", anchor.features = features)
+combined.eggen <- IntegrateData(anchorset = anchors, normalization.method = "SCT") 
+
+# specify that downstream analysis on the corrected data; note that the original unmodified data still resides in the 'RNA' assay
+DefaultAssay(combined.eggen) <- "integrated"
+
+# Run the standard workflow for visualization and clustering
+combined.eggen <- RunPCA(combined.eggen)
+
+setwd(wd)
+tiff("ElbowPlot.tiff", width=600, height=600, res=120)
+ElbowPlot(object = combined.eggen)
+dev.off()
+
+# Test different PCA # and resolution combos
+combined.eggen <- FindNeighbors(object = combined.eggen, reduction = "pca", dims = 1:30) 
+combined.eggen <- FindClusters(object = combined.eggen, resolution = 0.5)
+
+head(x = Idents(object = combined.eggen), 5)
+
+combined.eggen <- RunUMAP(combined.eggen, reduction = "pca", dims = 1:30) #forms clearer cluster definitions
+combined.eggen <- RunTSNE(combined.eggen, reduction = "pca", dims = 1:30)
+
+# Save object!!
+setwd(wd)
+saveRDS(combined.eggen, file = "combined_eggen.rds")
+
+# Visualization 1
+setwd(wd)
+tiff("umap_origID_1_PC30_res05.tiff", width=2000, height=1000, res=120)
+p1 <- DimPlot(combined.eggen, reduction = "umap", group.by = "orig.ident")
+p2 <- DimPlot(combined.eggen, reduction = "umap", label = TRUE, repel = TRUE)
+p1 + p2
+tiff("tsne_origID_1_PC30_res05.tiff", width=2000, height=1000, res=120)
+p1 <- DimPlot(combined.eggen, reduction = "tsne", group.by = "orig.ident")
+p2 <- DimPlot(combined.eggen, reduction = "tsne", label = TRUE, repel = TRUE)
+p1 + p2
+dev.off()
+
+data("HgProteinCodingGenes")
+combined.eggen <- combined.eggen[rownames(combined.eggen) %in% HgProteinCodingGenes,]
+
+combined.eggen <- RunMCA(combined.eggen, nmcs = 50)
+
+combined.eggen <- RunPCA(combined.eggen)
+combined.eggen <- RunUMAP(combined.eggen, dims = 1:30)
+combined.eggen <- RunTSNE(combined.eggen, dims = 1:30)
+PCA  <- DimPlot(combined.eggen, reduction = "pca")  + ggtitle("PCA") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+tSNE <- DimPlot(combined.eggen, reduction = "tsne")+ ggtitle("tSNE") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+UMAP <- DimPlot(combined.eggen, reduction = "umap") + ggtitle("UMAP") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+MCA <- DimPlot(combined.eggen, reduction = "mca")  + ggtitle("MCA") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+
+setwd(wd)
+tiff("cellID_MCA_PCA.tiff", width=2000, height=1000, res=120)
+ggarrange(PCA, MCA, common.legend = T, legend = "top")
+tiff("cellID_tSNE_UMAP.tiff", width=2000, height=1000, res=120)
+ggarrange(tSNE, UMAP, common.legend = T, legend = "top")
+dev.off()
+
+# cell to cell matching
+HGT_cell_gs <- RunCellHGT(combined.eggen, pathways = cell_gs, dims = 1:50)
+
+cell_gs_match <- rownames(HGT_cell_gs)[apply(HGT_cell_gs, 2, which.max)]
+cell_gs_prediction <- object$celltype[cell_gs_match]
+cell_gs_prediction_signif <- ifelse(apply(HGT_cell_gs, 2, max)>2, yes = cell_gs_prediction, "unassigned")
+combined.eggen$cell_gs_prediction <- cell_gs_prediction_signif
+
+setwd(wd)
+tiff("cell_cell_predict.tiff", width=1000, height=1000, res=120)
+DimPlot(combined.eggen, group.by = "cell_gs_prediction", pt.size = 0.2, reduction = "umap") +
+  ggtitle("Predicitons") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+dev.off()
+
+# group to cell matching
+HGT_group_gs <- RunCellHGT(combined.eggen, pathways = group_gs, dims = 1:50)
+
+group_gs_prediction <- rownames(HGT_group_gs)[apply(HGT_group_gs, 2, which.max)]
+group_gs_prediction_signif <- ifelse(apply(HGT_group_gs, 2, max)>2, yes = group_gs_prediction, "unassigned")
+combined.eggen$group_gs_prediction <- group_gs_prediction_signif
+
+setwd(wd)
+tiff("group_cell_predict.tiff", width=1000, height=1000, res=120)
+DimPlot(combined.eggen, group.by = "group_gs_prediction", pt.size = 0.2, reduction = "umap") + 
+  ggtitle("Predicitons") + theme(legend.text = element_text(size =10), aspect.ratio = 1)
+dev.off()
+
+# KEGG pathway
+# Downloading functional gene sets: For computational reasons, we just developed here the assessment on Hallmark MSigDB gene sets that is provided in the package. Other functionnal pathways can be obtained using the msigdbr package (didn't run this block yet)
+library(msigdbr)
+msigdf <- msigdbr::msigdbr(species = "Homo sapiens")
+msigdf_filtered <- msigdf %>% dplyr::select(gs_cat, gs_subcat, gs_name, gene_symbol, gs_description) %>%
+  filter(gs_subcat == "CP:KEGG") %>%
+  mutate(gs_subcat = ifelse(gs_subcat == "", "Hallmark", gs_subcat))
+KEGGgenesetDF <- msigdf_filtered %>%  mutate(gs_name = str_replace(sub("^.*?_{1}", "", gs_name), "_", "\\-")) %>%
+  group_by(gs_subcat, gs_name) %>%
+  summarise(geneset = list(gene_symbol)) %>%
+  group_by(gs_subcat) %>%
+  summarise(all_geneset = list(setNames(geneset, gs_name))) 
+KEGGgeneset <- setNames(KEGGgenesetDF$all_geneset, KEGGgenesetDF$gs_subcat)
+
+# Assessing per-cell functional enrichment analyses
+HGT_Hallmark <- RunCellHGT(object, pathways = Hallmark, dims = 1:50)
+HGT_KEGG <- RunCellHGT(object, pathways = KEGGgeneset$`CP:KEGG`, dims = 1:50)
+
+object@assays[["Hallmark"]] <- CreateAssayObject(HGT_Hallmark)
+object@assays[["KEGG"]] <- CreateAssayObject(HGT_KEGG)
+# Visualizing per-cell functional enrichment annotations in  MCA, PCA, tSNE, UMAP
+g1 <- FeaturePlot(object, "WNT-SIGNALING-PATHWAY", order = T, reduction = "umap", cols = c("grey", "red")) + 
+      theme(legend.text = element_text(size =10), aspect.ratio = 1)
+g1
+
+setwd(wd)
+tiff("FeatPlot_VEGF.tiff", width=500, height=500, res=120)
+g1
+dev.off()
+
+```
+
+```{r pseudobulk}
+#ref: https://hbctraining.github.io/scRNA-seq/lessons/pseudobulk_DESeq2_scrnaseq.html 
+library(SingleCellExperiment)
+library(scater)
+library(Seurat)
+library(tidyverse)
+library(cowplot)
+library(Matrix.utils)
+library(edgeR)
+library(dplyr)
+library(magrittr)
+library(Matrix)
+library(purrr)
+library(reshape2)
+library(S4Vectors)
+library(tibble)
+library(SingleCellExperiment)
+library(pheatmap)
+library(apeglm)
+library(png)
+library(DESeq2)
+library(RColorBrewer)
+library(xlsx)
+library(readxl)
+
+seurat <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/Final/CTRL_mg_171823gw/Mg_17_18_23gw.rds")
+
+# Extract raw counts and metadata to create SingleCellExperiment object
+counts <- seurat@assays$RNA@counts 
+colnames(seurat@meta.data)
+metadata <- seurat@meta.data 
+
+# Set up metadata as desired for aggregation and DE analysis
+#metadata$cluster_id <- factor(seurat@meta.data$celltype)
+metadata$sample_id <- factor(seurat@meta.data$orig.ident)
+# Create single cell experiment object
+sce <- SingleCellExperiment(assays = list(counts = counts), colData = metadata)
+# Identify groups for aggregation of counts
+groups <- colData(sce)[, c("sample_id")]
+
+# Explore the raw counts for the dataset
+## Explore the raw counts for the dataset
+dim(counts(sce))
+counts(sce)[1:6, 1:6]
+## Explore the cellular metadata for the dataset
+dim(colData(sce))
+head(colData(sce))
+
+# Named vector of sample names
+sids <- purrr::set_names(levels(sce$sample_id))
+# Total number of samples 
+ns <- length(sids); ns
+
+# Generate sample level metadata
+## Determine the number of cells per sample
+table(sce$sample_id)
+## Turn named vector into a numeric vector of number of cells per sample
+n_cells <- as.numeric(table(sce$sample_id)); n_cells
+## Determine how to reorder the samples (rows) of the metadata to match the order of sample names in sids vector
+m <- match(sids, sce$sample_id)
+## Create the sample level metadata by combining the reordered metadata with the number of cells corresponding to each sample.
+ei <- data.frame(colData(sce)[m, ], n_cells, row.names = NULL); ei
+
+# Aggregate the counts per sample_id and cluster_id
+# Subset metadata to only include the cluster and sample IDs to aggregate across
+groups <- colData(sce)[, c("sample_id")] ## change to only sample_id 
+# Aggregate across cluster-sample groups
+pb <- aggregate.Matrix(t(counts(sce)), groupings = groups, fun = "sum") 
+class(pb); dim(pb)
+pb[, 1:10]
+
+# Generate count mtx and sample table (based on metadata)
+cluster_counts <- t(pb); cluster_counts[1:10,]
+cluster_metadata <- read_excel("/Users/jiapei/Desktop/single_cell_analysis/pseudobulk/sample_table.xlsx")
+rownames(cluster_metadata) <- cluster_metadata$orig.ident
+# Check that all row names of metadata are the same and in the same order as column names of counts in order to use as input to DESeq2
+all(rownames(cluster_metadata) == colnames(cluster_counts)) # should return TRUE
+
+# Generate DGE matrix for DESeq2
+dds <- DESeqDataSetFromMatrix(cluster_counts, 
+                              colData = cluster_metadata, 
+                              design = ~ region + age)
+
+# Transform counts for data visualization
+rld <- rlog(dds, blind=T)
+# Plot PCA
+wd <- "/Users/jiapei/Desktop/single_cell_analysis/pseudobulk"
+setwd(wd)
+tiff("DESeq2_PCA_mg_region.tiff", width=500, height=500, res=120)
+DESeq2::plotPCA(rld, intgroup = "region")
+dev.off()
+
+# Hierarchical clustering
+# Extract the rlog matrix from the object and compute pairwise correlation values
+rld_mat <- assay(rld)
+rld_cor <- cor(rld_mat)
+# Plot heatmap
+setwd(wd)
+tiff("DESeq2_heatmap_mg.tiff", width=700, height=500, res=120)
+pheatmap(rld_cor, annotation = cluster_metadata[, c("region_label"), drop=F])
+dev.off()
+
+# Run DESeq2 differential expression analysis
+dds <- DESeq(dds)
+# Plot dispersion estimates
+plotDispEsts(dds)
+```
+
+```{r monocle3 setup}
+# NEED TO RUN FROM MONOCLE3 ENVIRONMENT
+if (!requireNamespace("BiocManager", quietly = TRUE))
+install.packages("BiocManager")
+BiocManager::install(version = "3.10") # NEED TO RUN FROM R3 ENVIRONMENT
+
+BiocManager::install(c('BiocGenerics', 'DelayedArray', 'DelayedMatrixStats',
+                       'limma', 'S4Vectors', 'SingleCellExperiment',
+                       'SummarizedExperiment', 'batchelor', 'Matrix.utils'))
+
+#install.packages("devtools", dependencies=T) # does not work in R 3.6.1
+library(devtools) # ended up installing devtools using conda install -c r r-devtools 
+# more: https://stackoverflow.com/questions/20923209/problems-installing-the-devtools-package 
+devtools::install_github('cole-trapnell-lab/leidenbase') #having lots of trouble installing this on mac (try linux at lab?)
+devtools::install_github('cole-trapnell-lab/monocle3')
+
+remotes::install_github('satijalab/seurat-wrappers')
+
+devtools::install_github('satijalab/seurat-data')
+
+library(monocle3)
+library(Seurat)
+library(SeuratData)
+library(SeuratWrappers)
+library(ggplot2)
+library(patchwork)
+library(magrittr)
+```
+
+```{r scvelo}
+library(Seurat)
+library(SeuratDisk)
+library(SeuratWrappers)
+library(devtools)
+library(tidyverse)
+#install_github("velocyto-team/velocyto.R")
+
+ldat <- ReadVelocity(file = "/Users/jiapei/Desktop/single_cell_analysis/scvelo/run_count_new_ctrl_GeMG.loom")
+GeMg_21gw <- as.Seurat(x = ldat)
+GeMg_21gw[["RNA"]] <- GeMg_21gw[["spliced"]]
+
+# change orig.ident
+object <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/new_20221024/by_origID/Mg_ctrl.rds")
+object@meta.data$orig.ident %>% table()
+
+GeMg_21gw_10x <- subset(object, subset = orig.ident == "GeMg_21gw")
+colnames(GeMg_21gw_10x) %>% head(3)
+colnames(GeMg_21gw) %>% head(3)
+
+cell_filter <- colnames(x = GeMg_21gw_10x)
+cell_filter <- str_replace(cell_filter, "-1_2", "x")
+cell_filter <- paste0("run_count_new_ctrl_GeMG:", cell_filter)
+# filter out cells with >5% mitochondrial genes; append percent.mt
+GeMg_21gw <- subset(GeMg_21gw, cells = cell_filter)
+GeMg_21gw@meta.data$percent.mt <- GeMg_21gw_10x@meta.data$percent.mt
+GeMg_21gw@meta.data$orig.ident <- "GeMg_21gw"
+GeMg_21gw@meta.data %>% head(2)
+nrow(GeMg_21gw@meta.data) == nrow(GeMg_21gw_10x@meta.data) #should return True
+
+GeMg_GMH_25gw <- subset(object, subset = orig.ident == "GeMg_GMH_25gw")
+GeMg_GMH_25gw_scvelo <- subset(object_scvelo, subset = orig.ident == "GeMg_GMH_25gw")
+#CtxMg_23gw@meta.data %>% head(3)
+#CtxMg_23gw_scvelo@meta.data %>% head(3)
+# filter out cells with >5% mitochondrial genes; append percent.mt & scrublet scores (not sure if this step is necessary)
+GeMg_GMH_25gw_scvelo@meta.data$percent.mt <- GeMg_GMH_25gw@meta.data$percent.mt # added here because for some reason percent.mt is 0 after loom (so appended percent.mt from before loom conversion)
+GeMg_GMH_25gw_scvelo@meta.data$scrublet <- GeMg_GMH_25gw@meta.data$scrublet
+GeMg_GMH_25gw_scvelo@meta.data$scrublet_num <- GeMg_GMH_25gw@meta.data$scrublet_num
+GeMg_GMH_25gw_scvelo@meta.data %>% head(3)
+
+# run merge pipeline (see above) and save as separate RDS object?
+setwd("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/new_20221024")
+DefaultAssay(object) <- "RNA"
+SaveH5Seurat(object, filename = "Mg_ctrl_20221024.h5Seurat")
+Convert("Mg_ctrl_20221024.h5Seurat", dest = "h5ad") # then go to python!
+```
+
+```{r cellphoneDB dotplot}
+library(tidyverse)
+library(dplyr)
+library(ggplot2)
+# input files
+wd = "/Users/jiapei/Desktop/single_cell_analysis/GMHvsCTRL_mgendo/MgEndo_origID_subsample3000_threshold25"
+setwd(wd)
+pvalues <- read.delim("pvalues.txt", header = T, sep = "\t")
+means <- read.delim("means.txt", header = T, sep = "\t")
+
+# define subgroups of interacting cell types
+interacting_cells <- 12:ncol(pvalues)
+CTX <- grep("CtxMg.*.CtxEndo|CtxEndo.*.CtxMg", colnames(pvalues)) 
+GE <- grep("GeMg.*.GeEndo|GeEndo.*.GeMg", colnames(pvalues))
+
+MgHomeo <- grep("Homeostatic.MG.*.ndo|Homeostatic.MG.*.Tip|Tip.*.Homeostatic.MG|ndo.*.Homeostatic.MG", colnames(pvalues))
+VAM <- grep("Vascul.assoc.MG.*.ndo|Vascul.assoc.MG.*.Tip|Tip.*.Vascul.assoc.MG|ndo.*.Vascul.assoc.MG", colnames(pvalues))
+HLA <- grep("HLA.*.ndo|HLA.*.Tip|Tip.*.HLA|ndo.*.HLA", colnames(pvalues))
+T_cell <- grep("T.cells.*.ndo|T.cells.*.Tip|Tip.*.T.cells|ndo.*.T.cells", colnames(pvalues))
+Cytotoxic <- grep("Cytotoxic.*.ndo|Cytotoxic.*.Tip|Tip.*.Cytotoxic|ndo.*.Cytotoxic", colnames(pvalues))
+Neutrophils <- grep("Neutrophils.*.ndo|Neutrophils.*.Tip|Tip.*.Neutrophils|ndo.*.Neutrophils", colnames(pvalues))
+
+interaction <- GE #change accordingly
+
+# pre-defined ligand-receptor pairs
+#setwd(wd)
+#selected_lr <- read.delim("rows_selected_EndoMg.txt", header = F, sep = "\t")
+#selected_rows <- match(t(selected_lr),pvalues$interacting_pair)
+# no selection on ligand-receptor pairs
+selected_rows <- 1:dim(pvalues)[1]
+
+selected_pvalues <- pvalues[selected_rows,interaction]
+selected_pvalues <- -log(selected_pvalues+0.001,10) #-log10 transform; added 0.001 to avoid INF
+filter <- rowSums(selected_pvalues, na.rm = T)>1 #exclude ligand-receptor pairs with no sig (pval = 1)
+selected_pvalues <- selected_pvalues[filter,] 
+
+selected_means <- means[selected_rows,interaction] #expression level (normalized)
+selected_means <- log(selected_means+0.9993071,2) #alog2 transform; added constant to avoid INF (min: -0.001)
+selected_means <- selected_means[filter,]
+#dim(selected_pvalues) == dim(selected_means)
+
+selected_rows <- selected_rows[filter]
+
+selected_df <- data.frame()
+for (i in 1:length(selected_rows)){
+  temp_df <- data.frame(cell_type = colnames(pvalues)[interaction], gene_pair = pvalues[selected_rows[i],]$interacting_pair, 
+                        m = t(selected_means[i,]), pval = t(selected_pvalues[i,]))
+  temp_df <- dplyr::rename(temp_df, m = colnames(temp_df)[3])
+  temp_df <- dplyr::rename(temp_df, pval = colnames(temp_df)[4])
+  selected_df <- rbind(selected_df,temp_df)
+}
+
+#lr_interest <- unique(selected_df$gene_pair)
+#setwd(wd)
+#write.table(lr_interest, 'lr_interest.txt',sep = '\t', row.names = F, col.names = F)
+
+setwd(wd)
+tiff("GE.tiff", width=1100, height=1000, res=120) #change accordingly
+
+f <- ggplot(selected_df, aes(x = cell_type, y = gene_pair)) +
+  geom_point(aes(size = pval, colour = m)) + 
+  theme(text = element_text(size=18), axis.text.x = element_text(angle = 20, hjust = 1)) +
+  scale_color_gradient(low="blue", high="red") +
+  xlab("Interacting cell types") +
+  ylab("Receptor-ligand pairs") +
+  theme(legend.position="top") +
+  guides(size=guide_legend(title="P value (-log10)")) +
+  guides(colour=guide_legend(title="Mean Expression (log2)"))
+#  theme(panel.background = element_rect(fill = "white", colour = "white"), 
+#        panel.grid.major = element_line(size = 0.5, linetype = 'solid',colour = "grey"))
+f
+
+dev.off()
+```
+
+```{r NicheNet setup}
+#devtools::install_github("saeyslab/nichenetr")
+library(nichenetr)
+library(tidyverse)
+library(ggplot2)
+library(circlize)
+library(dplyr)
+library(Seurat)
+
+# Load Seurat object and add meta.data for differential expression conditions
+object <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/GMHvsCTRL_mgendo/GMHvsCTRL_mgendo.rds")
+object$celltype_copy <- object$celltype
+object <- SetIdent(object, value = object[["celltype_copy"]]); levels(object)
+
+## TEST ##
+test = subset(object_og, idents = "Mitotic")
+test <- SetIdent(test, value = test[["niche"]]); levels(test)
+test_DEG = FindMarkers(test, ident.1 = "GeEndo", ident.2 = "CtxEndo", min.pct = 0.1)
+sum(test_DEG$avg_log2FC > 0) # number of upreg genes in GE (ident.1)
+sum(test_DEG$avg_log2FC < 0) # number of upreg genes in CTX (ident.2)
+
+#subset Seurat obj accordingly
+object <- subset(x = object_2023, idents = c("Mitotic", "1 Homeostatic MG 1","5 Vascul-assoc MG","6 Monocytes","7 HLA+ My")) #"Capillary" "Arterial"  "Venous"   "Tip"   "Mitotic"  
+levels(x = object)
+
+#colnames(x = object[[]])
+object$celltype <- object$niche2 #need to specify celltype for downstream NicheNet analysis
+object@meta.data$celltype %>% table() #should be categories in niche
+object <- SetIdent(object, value = object[["niche2"]])
+Idents(object = object) %>% table() #should be categories in niche
+
+# Define groups (needed for downstream analysis)
+new_label <- object@meta.data$niche2
+new_label[new_label=="ENDO_ctrl"] <- "CTRL"
+new_label[new_label=="MG_ctrl"] <- "CTRL"
+new_label[new_label=="MG_GMH"] <- "GMH"
+new_label[new_label=="ENDO_GMH"] <- "GMH"
+object$groups <- new_label
+object@meta.data$groups %>% table()
+#DimPlot(object, reduction = "umap", group.by = "groups") 
+
+# Load prior ligand-receptor model from NicheNet
+# ref: https://zenodo.org/record/3260758 
+ligand_target_matrix = readRDS("/Users/jiapei/Desktop/single_cell_analysis/NicheNet/ligand_target_matrix.rds")
+# target genes in rows, ligands in columns
+lr_network = readRDS("/Users/jiapei/Desktop/single_cell_analysis/NicheNet/lr_network.rds")
+weighted_networks = readRDS("/Users/jiapei/Desktop/single_cell_analysis/NicheNet/weighted_networks.rds")
+weighted_networks_lr = weighted_networks$lr_sig %>% inner_join(lr_network %>% distinct(from,to), by = c("from","to"))
+#head(weighted_networks$lr_sig) # interactions and their weights in the ligand-receptor + signaling network
+#head(weighted_networks$gr) # interactions and their weights in the gene regulatory network
+```
+```{r NicheNet human genes to mouse genes}
+# NicheNet genes are human, the following code is to convert to orthogonal mouse genes
+lr_network = lr_network %>% mutate(from = convert_human_to_mouse_symbols(from), to = convert_human_to_mouse_symbols(to)) %>% drop_na()
+colnames(ligand_target_matrix) = ligand_target_matrix %>% colnames() %>% convert_human_to_mouse_symbols()
+rownames(ligand_target_matrix) = ligand_target_matrix %>% rownames() %>% convert_human_to_mouse_symbols()
+ligand_target_matrix = ligand_target_matrix %>% .[!is.na(rownames(ligand_target_matrix)), !is.na(colnames(ligand_target_matrix))]
+weighted_networks_lr = weighted_networks_lr %>% mutate(from = convert_human_to_mouse_symbols(from), to = convert_human_to_mouse_symbols(to)) %>% drop_na()
+```
+
+```{r NicheNet define receivers, senders, DE comparison}
+# Define sender/niche and receiver/target
+levels(x = object)
+
+## receiver
+receiver = c("ENDO_ctrl","ENDO_GMH")
+receiver_pct = 0.2
+#expressed_genes_receiver = get_expressed_genes(receiver, object, pct = receiver_pct)
+#length(expressed_genes_receiver) #genes expr by pct(%) cells
+list_expressed_genes_receiver = receiver %>% unique() %>% lapply(get_expressed_genes, object, pct = receiver_pct) #, assay_oi = "SCT"
+#set threshold at 0.8 to exclude any genes that might belong to sender cell type
+expressed_genes_receiver = list_expressed_genes_receiver %>% unlist() %>% unique() #check size of vector! (not empty and ~1000)
+background_expressed_genes = expressed_genes_receiver %>% .[. %in% rownames(ligand_target_matrix)]
+
+## sender
+sender_celltypes = c("MG_ctrl","MG_GMH")
+sender_pct = 0.2
+#expressed_genes_sender_check = get_expressed_genes(sender_celltypes, object, pct = sender_pct)
+#expressed_genes_sender_check                                                               
+list_expressed_genes_sender = sender_celltypes %>% unique() %>% lapply(get_expressed_genes, object, pct = sender_pct, assay_oi = "SCT")
+expressed_genes_sender = list_expressed_genes_sender %>% unlist() %>% unique() #check size of vector! (not empty and ~1000)
+# remove ligands that are expressed on receiver population (for cell type specificity); comment out if all ligands get removed!
+#nonsp = c(expressed_genes_receiver,expressed_genes_sender)
+#nonsp = nonsp[duplicated(nonsp)]
+#expressed_genes_sender = expressed_genes_sender[!expressed_genes_sender %in% nonsp]
+
+# Define gene set of interest
+seurat_obj_receiver= subset(object, idents = receiver)
+seurat_obj_receiver = SetIdent(seurat_obj_receiver, value = seurat_obj_receiver[["groups"]])
+condition_oi = "GMH"
+condition_reference = "CTRL" # order doesn't matter, unless you specify only.pos = T
+DE_table_receiver = FindMarkers(object = seurat_obj_receiver, ident.1 = condition_oi, ident.2 = condition_reference, 
+                                min.pct = 0.1) %>% rownames_to_column("gene") # very few genes upreg in GE for endo (more downreg)
+# only.pos = T <- enriched in condition_oi; but looks like ligand prediction ends up with the same set of genes regardless or pos or neg
+# increased min.pct from 0.1 to 0.25 (for higher condition specificity)
+setwd(wd)
+write.table(DE_table_receiver, 'DE_table_receiver.txt',sep = '\t', row.names = F, col.names = T)
+
+# no filter
+geneset_oi = DE_table_receiver %>% pull(gene)
+# or filter
+geneset_oi = DE_table_receiver %>% filter(p_val_adj < 0.05 & avg_log2FC > 2) %>% pull(gene) # check DE_table_receiver to adjust avg_log2FC
+# or define geneset_oi manually
+geneset_oi <- c()
+
+geneset_oi = geneset_oi %>% .[. %in% rownames(ligand_target_matrix)]
+```
+
+```{r NicheNet define and analyze ligands}
+# Define potential ligands
+ligands = lr_network %>% pull(from) %>% unique()
+receptors = lr_network %>% pull(to) %>% unique()
+expressed_ligands = intersect(ligands,expressed_genes_sender) #affected by prev code/settings
+expressed_receptors = intersect(receptors,expressed_genes_receiver) #affected by prev code/settings
+potential_ligands = lr_network %>% filter(from %in% expressed_ligands & to %in% expressed_receptors) %>% pull(from) %>% unique()
+
+# Ligand activity analysis
+# i.e. rank potential ligands based on the presence of their target genes in gene set of interest 
+ligand_activities = predict_ligand_activities(geneset = geneset_oi, background_expressed_genes = background_expressed_genes, 
+                                              ligand_target_matrix = ligand_target_matrix, 
+                                              potential_ligands = potential_ligands)
+view(ligand_activities)
+#ligand_activities = ligand_activities %>% arrange(-pearson) %>% mutate(rank = base::rank(dplyr::desc(pearson)))
+#ligand_activities = subset(ligand_activities, pearson > 0.01) 
+
+# Pearson correlation ~ 0: for ligands expressed in sender cells, there is no enrichment of target genes in the geneset of interest compared to the background; i.e. no evidence that sender cell is regulating gene expression changes in receiver cell
+# Pearson correlation < 0: there is enrichment of top predicted target genes in the background compared to the gene set of interest. When these values are negative, but very close to zero, there is nothing to worry about. But when these values are really negative, this can indicate that something went wrong in the analysis, probably in the definition of background and gene set of interest.
+# If you get AUROC values < 0.5 and negative PCCs, this indicate that there are more targets of selected ligands in the background of expressed genes compared to DE genes between your conditions. This can be due to the possible false assumption that ligands from sender cells cause differences between conditions in receiver cell.
+
+# only include ligands with positive pearson values to predict target genes
+best_upstream_ligands = subset(ligand_activities, pearson > 0) %>% pull(test_ligand) %>% unique()
+best_upstream_ligands <- best_upstream_ligands[!best_upstream_ligands %in% c("OSM")] # remove any unwanted ligands (confusing ones)
+# top 20 ranked ligands that can be used to predict target genes
+best_upstream_ligands = ligand_activities %>% top_n(20, pearson) %>% arrange(-pearson) %>% pull(test_ligand) %>% unique()
+# or define it as your ligands of interest
+best_upstream_ligands = ligand_activities$test_ligand #no filter
+avg_expr = AverageExpression(object, features = best_upstream_ligands) 
+avg_expr_df <- data.frame(unlist(avg_expr$RNA))
+avg_expr_df <- avg_expr_df %>% mutate( diff = (CTX_MG + GE_MG)/2 / (CTX_ENDO + GE_ENDO)/2) # change accordingly
+best_upstream_ligands <- rownames(subset(avg_expr_df, diff < 1/(2^50))) # pick genes that have higher expression in mg (change accordingly)
+best_upstream_ligands
+# or define it manually
+best_upstream_ligands <- c("CXCL12","CX3CL1")
+
+# Plot top ligands
+setwd(wd)
+tiff("Top_ligand.tiff", width=1800, height=600, res=120)
+DotPlot(object, features = best_upstream_ligands %>% rev(), cols = "RdYlBu", assay = "RNA") + RotatedAxis()
+dev.off()
+
+# Plot top 20 ligands based on groups (e.g. region) and Violin plots of selected ligands 
+#setwd(wd)
+#tiff("MgEndo_select_ligand_mg_groups.tiff", width=1000, height=800, res=120)
+#DotPlot(object, features = nichenet_output$top_ligands %>% rev(), split.by = "groups") + RotatedAxis()
+#tiff("MgEndo_23gw_top20ligand_endo_genes.tiff", width=2000, height=400, res=120)
+#VlnPlot(object = object, features = c("PECAM1", "ADAM17","ITGAM"), split.by = "groups", pt.size = 0, combine = T)
+#dev.off()
+```
+
+```{r NicheNet infer TARGETS}
+# Infer receptors
+active_ligand_target_links_df = best_upstream_ligands %>% 
+  lapply(get_weighted_ligand_target_links, geneset = geneset_oi, ligand_target_matrix = ligand_target_matrix, n = 200) %>% 
+  bind_rows() %>% drop_na() # n determines number of targets per ligand that are included in the downstream analysis
+active_ligand_target_links = prepare_ligand_target_visualization(
+  ligand_target_df = active_ligand_target_links_df, ligand_target_matrix = ligand_target_matrix, cutoff = 0.1) #higher cutoff = more stringent
+
+order_ligands = intersect(best_upstream_ligands, colnames(active_ligand_target_links)) %>% rev() %>% make.names()
+order_targets = active_ligand_target_links_df$target %>% unique() %>% intersect(rownames(active_ligand_target_links)) %>% make.names()
+
+rownames(active_ligand_target_links) = rownames(active_ligand_target_links) %>% make.names() 
+colnames(active_ligand_target_links) = colnames(active_ligand_target_links) %>% make.names() 
+
+vis_ligand_target = active_ligand_target_links[order_targets,order_ligands] %>% t()
+
+p_ligand_target_network = vis_ligand_target %>% 
+  make_heatmap_ggplot("Prioritized ligands","Predicted target genes", color = "purple", legend_position = "right", 
+                      x_axis_position = "top", legend_title = "Regulatory potential")  + 
+  theme(axis.text.x = element_text(face = "italic")) +
+  theme(axis.text.x.top = element_text(vjust = 0.5)) + 
+  theme(legend.direction="vertical") +
+  scale_fill_gradient2(low = "whitesmoke", high = "purple")
+# if ligands are left out, it's because they don’t have target genes with high enough regulatory potential scores
+# To include them, you can be less stringent in the cutoff
+# To increase number of targets, increase n (see above)
+
+# Plot predicted target genes of top ligands
+setwd(wd)
+tiff("Top_ligand_predictTarget.tiff", width=2000, height=400, res=120)
+p_ligand_target_network
+dev.off()
+```
+
+```{r NicheNet infer RECEPTORS}
+# Find receptors of top-ranked ligands
+lr_network_top = lr_network %>% filter(from %in% best_upstream_ligands & to %in% expressed_receptors) %>% distinct(from,to)
+best_upstream_receptors = lr_network_top %>% pull(to) %>% unique()
+
+lr_network_top_df_large = weighted_networks_lr %>% filter(from %in% best_upstream_ligands & to %in% best_upstream_receptors)
+
+lr_network_top_df = lr_network_top_df_large %>% spread("from","weight",fill = 0)
+lr_network_top_matrix = lr_network_top_df %>% select(-to) %>% as.matrix() %>% magrittr::set_rownames(lr_network_top_df$to)
+
+dist_receptors = dist(lr_network_top_matrix, method = "binary")
+hclust_receptors = hclust(dist_receptors, method = "ward.D2")
+order_receptors = hclust_receptors$labels[hclust_receptors$order]
+    
+dist_ligands = dist(lr_network_top_matrix %>% t(), method = "binary")
+hclust_ligands = hclust(dist_ligands, method = "ward.D2")
+order_ligands_receptor = hclust_ligands$labels[hclust_ligands$order]
+
+order_receptors = order_receptors %>% intersect(rownames(lr_network_top_matrix))
+order_ligands_receptor = order_ligands_receptor %>% intersect(colnames(lr_network_top_matrix))
+
+vis_ligand_receptor_network = lr_network_top_matrix[order_receptors, order_ligands_receptor]
+rownames(vis_ligand_receptor_network) = order_receptors %>% make.names()
+colnames(vis_ligand_receptor_network) = order_ligands_receptor %>% make.names()
+
+p_ligand_receptor_network = vis_ligand_receptor_network %>% t() %>% 
+  make_heatmap_ggplot("Ligands","Receptors", color = "mediumvioletred", 
+                      x_axis_position = "top",legend_title = "Prior interaction potential") +
+  theme(axis.text.x.top = element_text(vjust = 0.5))
+
+# Plot predicted receptors of top 20 ligands
+setwd(wd)
+tiff("Top_ligand_predictReceptor.tiff", width=1500, height=1000, res=120)
+p_ligand_receptor_network
+dev.off()
+
+# Further filtering potential ligand-receptor pairs with published literature and databses
+lr_network_strict = lr_network %>% filter(database != "ppi_prediction_go" & database != "ppi_prediction")
+ligands_bona_fide = lr_network_strict %>% pull(from) %>% unique()
+receptors_bona_fide = lr_network_strict %>% pull(to) %>% unique()
+
+lr_network_top_df_large_strict = lr_network_top_df_large %>% distinct(from,to) %>% inner_join(lr_network_strict, by = c("from","to")) %>% distinct(from,to)
+lr_network_top_df_large_strict = lr_network_top_df_large_strict %>% inner_join(lr_network_top_df_large, by = c("from","to"))
+
+lr_network_top_df_strict = lr_network_top_df_large_strict %>% spread("from","weight",fill = 0)
+lr_network_top_matrix_strict = lr_network_top_df_strict %>% select(-to) %>% as.matrix() %>% magrittr::set_rownames(lr_network_top_df_strict$to)
+
+dist_receptors = dist(lr_network_top_matrix_strict, method = "binary")
+hclust_receptors = hclust(dist_receptors, method = "ward.D2")
+order_receptors = hclust_receptors$labels[hclust_receptors$order]
+
+dist_ligands = dist(lr_network_top_matrix_strict %>% t(), method = "binary")
+hclust_ligands = hclust(dist_ligands, method = "ward.D2")
+order_ligands_receptor = hclust_ligands$labels[hclust_ligands$order]
+
+order_receptors = order_receptors %>% intersect(rownames(lr_network_top_matrix_strict))
+order_ligands_receptor = order_ligands_receptor %>% intersect(colnames(lr_network_top_matrix_strict))
+
+vis_ligand_receptor_network_strict = lr_network_top_matrix_strict[order_receptors, order_ligands_receptor]
+rownames(vis_ligand_receptor_network_strict) = order_receptors %>% make.names()
+colnames(vis_ligand_receptor_network_strict) = order_ligands_receptor %>% make.names()
+
+p_ligand_receptor_network_strict = vis_ligand_receptor_network_strict %>% t() %>% 
+  make_heatmap_ggplot("Ligands","Receptors", color = "mediumvioletred", 
+                      x_axis_position = "top",legend_title = "Prior interaction potential\n(bona fide)")
+
+# Plot predicted receptors (published) of top 20 ligands
+setwd(wd)
+tiff("Top_ligand_verifiedReceptor.tiff", width=500, height=500, res=120)
+p_ligand_receptor_network_strict
+dev.off()
+```
+
+```{r NicheNet Circos plot - start with initialized ligand_target_matrix etc from prev NicheNet code}
+# this code block allows more customization
+#best_upstream_ligands <- best_upstream_ligands[!best_upstream_ligands %in% c("APP","APLN")] #exclude any ligands with no target genes
+avg_expression_ligands = AverageExpression(object, features = best_upstream_ligands, group.by = "region", assays = "RNA")
+
+# which cell subpop express top ligands? seems to include both receiver and sender cell subpops
+sender_ligand_assignment = avg_expression_ligands$RNA %>% 
+  apply(1, function(ligand_expression){ligand_expression > (ligand_expression %>% mean() + ligand_expression %>% sd())}) %>% t()
+# remove + ligand_expression %>% sd() if sender_ligand_assigment is a matrix with all FALSE values
+sender_ligand_assignment = sender_ligand_assignment %>% 
+  apply(2, function(x){x[x == TRUE]}) %>% purrr::keep(function(x){length(x) > 0})
+
+# which ligands are common across multiple cell types?
+all_assigned_ligands = sender_ligand_assignment %>% lapply(function(x){names(x)}) %>% unlist()
+unique_ligands = all_assigned_ligands %>% table() %>% .[. == 1] %>% names()
+general_ligands = best_upstream_ligands %>% setdiff(unique_ligands)
+sender_ligand_assignment
+
+# change accordingly
+#homeo_ligands = sender_ligand_assignment$`1 Homeostatic MG 1` %>% names() %>% setdiff(general_ligands)
+#vam_ligands = sender_ligand_assignment$`5 Vascul-assoc MG` %>% names() %>% setdiff(general_ligands)
+ctx_ligands = sender_ligand_assignment$`CTX` %>% names() %>% setdiff(general_ligands)
+ge_ligands = sender_ligand_assignment$`GE` %>% names() %>% setdiff(general_ligands)
+#remove_na = remove_na[!is.na(remove_na)] # remove any NA ligands
+
+ligand_type_indication_df = tibble(
+  ligand_type = c(rep("ctx", times = ctx_ligands %>% length()),
+                  rep("ge", times = ge_ligands %>% length())), #rep("General", times = general_ligands %>% length())
+  ligand = c(ctx_ligands, ge_ligands)) # change accordingly
+
+# define ligand-targets of interest (n = 20: top 20 targets for each ligand)
+#active_ligand_target_links_df = best_upstream_ligands %>% lapply(get_weighted_ligand_target_links, geneset = geneset_oi, ligand_target_matrix = ligand_target_matrix, n = 2000) %>% bind_rows() %>% drop_na() #already ran in prev block
+active_ligand_target_links_df = active_ligand_target_links_df %>% mutate(target_type = "up") %>% inner_join(ligand_type_indication_df)
+active_ligand_target_links_df$ligand_type %>% table()
+
+circos_links = active_ligand_target_links_df #check if empty, adjust prev parameters if so
+```
+
+```{r NicheNet Circos plot - ligands and TARGET genes}
+# Circos visualization setup
+grid_col_ligand =c("ctx" = "blue", "ge" = "red") # change accordingly # "General" = "beige"
+grid_col_target =c("up" = "grey") # change accordingly (receiver color)
+
+grid_col_tbl_ligand = tibble(ligand_type = grid_col_ligand %>% names(), color_ligand_type = grid_col_ligand)
+grid_col_tbl_target = tibble(target_type = grid_col_target %>% names(), color_target_type = grid_col_target)
+
+circos_links = circos_links %>% mutate(ligand = paste(ligand," ")) # extra space: differentiate btwn a gene as ligand and a gene as target!
+circos_links = circos_links %>% inner_join(grid_col_tbl_ligand) %>% inner_join(grid_col_tbl_target)
+links_circle = circos_links %>% select(ligand, target, weight)
+
+ligand_color = circos_links %>% distinct(ligand,color_ligand_type)
+grid_ligand_color = ligand_color$color_ligand_type %>% set_names(ligand_color$ligand)
+target_color = circos_links %>% distinct(target,color_target_type)
+grid_target_color = target_color$color_target_type %>% set_names(target_color$target)
+
+grid_col =c(grid_ligand_color,grid_target_color)
+
+# give the option that links in the circos plot will be transparant ~ ligand-target potential score
+transparency = circos_links %>% mutate(weight =(weight-min(weight))/(max(weight)-min(weight))) %>% 
+  mutate(transparency = 1-weight) %>% .$transparency 
+
+# order ligands and targets
+target_order = circos_links$target %>% unique()
+# change accordingly!
+set_ligand_order = c(ctx_ligands, ge_ligands) #general_ligands
+ligand_order = set_ligand_order %>% c(paste(.," ")) %>% intersect(circos_links$ligand)
+order = c(ligand_order,target_order)
+
+# define gaps between different segments
+width_same_cell_same_ligand_type = 0.5
+width_different_cell = 0.5 #width_different_cell = 4
+width_ligand_target = 8
+width_same_cell_same_target_type = 0.5
+
+# change accordingly
+gaps_init = c(
+  rep(width_same_cell_same_ligand_type, times = (circos_links %>% filter(ligand_type == "ctx") %>% distinct(ligand) %>% nrow() -1)),
+  width_different_cell,
+  rep(width_same_cell_same_ligand_type, times = (circos_links %>% filter(ligand_type == "ge") %>% distinct(ligand) %>% nrow() -1)),
+  #width_different_cell,
+  #rep(width_same_cell_same_ligand_type, times = (circos_links %>% filter(ligand_type == "General") %>% distinct(ligand) %>% nrow() -1)),
+  width_ligand_target)
+
+gaps = c(gaps_init,
+  rep(width_same_cell_same_target_type, times = (circos_links %>% filter(target_type == "up") %>% distinct(target) %>% nrow() -1)),
+  width_ligand_target) # skipped activated and prolif mg because no ligand identified? 
+
+library(ComplexHeatmap)
+circos.par(gap.degree = gaps)
+lgd_colors = c("blue","red") # to be reused in ligand-receptor circos plot
+lgd_names = c("CTX CD45+ (ligands)", "GE CD45+ (ligands)") # to be reused in ligand-receptor circos plot # Shared (ligands)
+lgd_lines = Legend(at = c(lgd_names,"Endothelial (targets)"), type = "points", 
+  legend_gp = gpar(col = c(lgd_colors,"grey")), 
+  title_position = "topleft", title = "Cell type")
+
+setwd(wd)
+tiff("TOPligand_target_circo.tiff", width=1200, height=1200, res=120)
+# width proportional to ligand-target regulatory potential (based on prior knowledge)
+chordDiagram(links_circle, directional = 1, order = order, link.sort = T, link.decreasing = F, 
+             grid.col = grid_col, transparency = 0, diffHeight = 0.005, direction.type = c("diffHeight", "arrows"), 
+             link.arr.type = "big.arrow", annotationTrack = "grid", preAllocateTracks = list(track.height = 0.075))
+# we go back to the first track and customize sector labels
+circos.track(track.index = 1, panel.fun = function(x, y) {circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index,
+                                                                      facing = "clockwise", niceFacing = T, adj = c(0,0.55), cex =1)},
+             bg.border = NA)
+# add legend
+draw(lgd_lines, x = unit(4, "mm"), y = unit(4, "mm"), just = c("left", "bottom"))
+dev.off()
+
+setwd(wd)
+tiff("TOPligand_target_circo_transparent.tiff", width=1200, height=1200, res=120)
+# transparency proportional to ligand-target regulatory potential (based on prior knowledge)
+chordDiagram(links_circle, directional = 1, order = order,link.sort = T, link.decreasing = F, grid.col = grid_col,
+             transparency = transparency, diffHeight = 0.005, direction.type = c("diffHeight", "arrows"), link.arr.type = "big.arrow",
+             annotationTrack = "grid", preAllocateTracks = list(track.height = 0.075))
+# we go back to the first track and customize sector labels
+circos.track(track.index = 1, panel.fun = function(x, y) {
+  circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index,facing = "clockwise", niceFacing = TRUE, 
+               adj = c(0, 0.55), cex = 1)}, bg.border = NA)
+# add legend
+draw(lgd_lines, x = unit(4, "mm"), y = unit(4, "mm"), just = c("left", "bottom"))
+dev.off()
+```
+
+```{r NicheNet Circos plot - ligands and RECEPTORS}
+lr_network_top_df = weighted_networks$lr_sig %>% filter(from %in% best_upstream_ligands & to %in% best_upstream_receptors) %>% 
+  dplyr::rename(ligand = from, receptor = to)
+lr_network_top_df = lr_network_top_df %>% mutate(receptor_type = "receptor") %>% inner_join(ligand_type_indication_df)
+
+## uncomment following line if not using customized geneset (e.g. only.pos = T) ##
+#lr_network_top_df = nichenet_output$ligand_receptor_df %>% mutate(receptor_type = "endo_receptor") %>% inner_join(ligand_type_indication_df)
+
+#grid_col_ligand =c("General" = "lawngreen","ctrl_mg_specific" = "royalblue","GMH_mg_specific" = "red") #defined in prev block, uncomment if you didn't run the prev block
+grid_col_receptor =c("receptor" = "grey") #"pink" "lightblue"
+
+grid_col_tbl_ligand = tibble(ligand_type = grid_col_ligand %>% names(), color_ligand_type = grid_col_ligand)
+grid_col_tbl_receptor = tibble(receptor_type = grid_col_receptor %>% names(), color_receptor_type = grid_col_receptor)
+
+circos_links = lr_network_top_df %>% mutate(ligand = paste(ligand," ")) # extra space between a gene as ligand and a gene as receptor!
+circos_links = circos_links %>% inner_join(grid_col_tbl_ligand) %>% inner_join(grid_col_tbl_receptor)
+links_circle = circos_links %>% select(ligand, receptor, weight)
+
+ligand_color = circos_links %>% distinct(ligand,color_ligand_type)
+grid_ligand_color = ligand_color$color_ligand_type %>% set_names(ligand_color$ligand)
+receptor_color = circos_links %>% distinct(receptor,color_receptor_type)
+grid_receptor_color = receptor_color$color_receptor_type %>% set_names(receptor_color$receptor)
+
+grid_col = c(grid_ligand_color,grid_receptor_color)
+
+# give the option that links in the circos plot will be transparant ~ ligand-receptor potential score
+transparency = circos_links %>% mutate(weight =(weight-min(weight))/(max(weight)-min(weight))) %>% mutate(transparency = 1-weight) %>% .$transparency 
+
+receptor_order = circos_links$receptor %>% unique()
+ligand_order = set_ligand_order %>% c(paste(.," ")) %>% intersect(circos_links$ligand)
+order = c(ligand_order,receptor_order)
+
+#width_same_cell_same_ligand_type = 0.5
+#width_different_cell = 4
+width_ligand_receptor = 8
+width_same_cell_same_receptor_type = 0.5
+
+# change accordingly
+gaps_init = c(
+  rep(width_same_cell_same_ligand_type, times = (circos_links %>% filter(ligand_type == "ctx") %>% distinct(ligand) %>% nrow() -1)),
+  width_different_cell,
+  rep(width_same_cell_same_ligand_type, times = (circos_links %>% filter(ligand_type == "ge") %>% distinct(ligand) %>% nrow() -1)),
+  #width_different_cell,
+  #rep(width_same_cell_same_ligand_type, times = (circos_links %>% filter(ligand_type == "General") %>% distinct(ligand) %>% nrow() -1)),
+  width_ligand_target) #need to run gaps_init again since circos_links changed!
+
+gaps = c(
+  gaps_init,
+  rep(width_same_cell_same_receptor_type, times = (circos_links %>% filter(receptor_type == "receptor") %>% distinct(receptor) %>% nrow() -1)),
+  width_ligand_receptor)
+
+circos.par(gap.degree = gaps)
+lgd_lines = Legend(at = c(lgd_names,"Endothelial (receptors)"), type = "points", 
+  legend_gp = gpar(col = c(lgd_colors,"grey")),
+  title_position = "topleft", title = "Cell type")
+
+setwd(wd)
+tiff("TOPligand_circo_receptor.tiff", width=1200, height=1200, res=120)
+chordDiagram(links_circle, directional = 1, order = order, link.sort = T, link.decreasing = F, 
+             grid.col = grid_col,transparency = 0, diffHeight = 0.005, direction.type = c("diffHeight", "arrows"),
+             link.arr.type = "big.arrow", annotationTrack = "grid", preAllocateTracks = list(track.height = 0.075)) 
+            #link.visible = links_circle$weight >= cutoff_include_all_ligands
+circos.track(track.index = 1, panel.fun = function(x, y) {circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index,
+                                                                      facing = "clockwise", niceFacing = T, adj = c(0, 0.55), cex = 1)},
+             bg.border = NA)
+# add legend
+draw(lgd_lines, x = unit(4, "mm"), y = unit(4, "mm"), just = c("left", "bottom"))
+dev.off()
+
+setwd(wd)
+tiff("TOPligand_circo_receptor_transparent.tiff", width=1200, height=1200, res=120)
+chordDiagram(links_circle, directional = 1, order = order, link.sort = T, link.decreasing = F, 
+             grid.col = grid_col, transparency = transparency, diffHeight = 0.005, direction.type = c("diffHeight", "arrows"),
+             link.arr.type = "big.arrow",annotationTrack = "grid", preAllocateTracks = list(track.height = 0.075))
+            #link.visible = links_circle$weight >= cutoff_include_all_ligands
+circos.track(track.index = 1, panel.fun = function(x, y) {circos.text(CELL_META$xcenter, CELL_META$ylim[1], CELL_META$sector.index, 
+                                                                      facing = "clockwise", niceFacing = T, adj = c(0,0.55), cex = 1)},
+             bg.border = NA) 
+# add legend
+draw(lgd_lines, x = unit(4, "mm"), y = unit(4, "mm"), just = c("left", "bottom"))
+dev.off()
+```
+
+# Single cell RNA-seq analysis using Seurat
+## Basic quality control and filtering
+We start the analysis after two preliminary steps: 1) ambient RNA correction using `soupX`; 2) doublet detection using `scrublet`. (not used here)
+If starting from typical `Cell Ranger` output, it's possible to choose if you want to use Ensemble ID or gene symbol for the count matrix. This is done using `gene.column` option; default is '2', which is gene symbol. 
+Meta.data is the most important field for next steps. It can be accessed using both @ and [[]] operators. Right now it has 3 fields per celL: dataset ID, number of UMI reads detected per cell (nCount_RNA), and the number of expressed (detected) genes per same cell (nFeature_RNA). 
+
+```{r cell cycle score}
+library(Seurat)
+library(ggplot2)
+library(SingleR)
+library(dplyr)
+library(celldex)
+library(RColorBrewer)
+library(SingleCellExperiment)
+
+srat <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/17_18_23_anchor_new/Mg_SCT.rds")
+srat
+#str(srat) #`str` commant allows us to see all fields of the class
+
+#Let's calculate cell cycle scores (https://satijalab.org/seurat/archive/v3.1/cell_cycle_vignette.html). This has to be done after normalization and scaling. Seurat has a built-in list, cc.genes (older) and cc.genes.updated.2019 (newer), that defines genes involved in cell cycle. For CellRanger reference GRCh38 2.0.0 and above, use cc.genes.updated.2019 (three genes were renamed: MLF1IP, FAM64A and HN1 became CENPU, PICALM and JPT). For mouse cell cycle genes you can use the solution detailed [here](https://github.com/satijalab/seurat/issues/2493). 
+cc.genes.updated.2019
+s.genes <- cc.genes.updated.2019$s.genes
+g2m.genes <- cc.genes.updated.2019$g2m.genes
+
+srat <- CellCycleScoring(srat, s.features = s.genes, g2m.features = g2m.genes)
+table(srat[[]]$Phase)
+
+VlnPlot(srat,features = c("S.Score","G2M.Score")) & theme(plot.title = element_text(size=10))
+```
+
+## Differential expression and marker selection
+If some clusters lack any notable markers, adjust the clustering. It is [recommended](https://github.com/satijalab/seurat/discussions/4032) to do differential expression on the `RNA` assay, and not the `SCTransform`.
+
+## Cell type annotation using SingleR
+Given the markers that we've defined, we can mine the literature and identify each cell type. However, we can try automaic annotation with SingleR, which can be used with Seurat, SCE, etc. Detailed signleR manual can be found [here](http://bioconductor.org/books/release/SingleRBook/).
+
+Let's get reference datasets from celldex package. Note that there are two cell type assignments, `label.main` and `label.fine`.
+
+```{r cell type label 1, warning=F,message=F}
+monaco.ref <- celldex::MonacoImmuneData()
+hpca.ref <- celldex::HumanPrimaryCellAtlasData()
+dice.ref <- celldex::DatabaseImmuneCellExpressionData()
+```
+
+Let's convert our Seurat object to single cell experiment (SCE) for convenience. After this, using `SingleR` becomes very easy: 
+
+```{r cell type label 2}
+sce <- as.SingleCellExperiment(DietSeurat(srat))
+sce
+
+monaco.main <- SingleR(test = sce,assay.type.test = 1,ref = monaco.ref,labels = monaco.ref$label.main)
+monaco.fine <- SingleR(test = sce,assay.type.test = 1,ref = monaco.ref,labels = monaco.ref$label.fine)
+hpca.main <- SingleR(test = sce,assay.type.test = 1,ref = hpca.ref,labels = hpca.ref$label.main)
+hpca.fine <- SingleR(test = sce,assay.type.test = 1,ref = hpca.ref,labels = hpca.ref$label.fine)
+dice.main <- SingleR(test = sce,assay.type.test = 1,ref = dice.ref,labels = dice.ref$label.main)
+dice.fine <- SingleR(test = sce,assay.type.test = 1,ref = dice.ref,labels = dice.ref$label.fine)
+```
+
+Let's see the summary of general cell type annotations. These match our expectations (and each other) reasonably well. 
+
+```{r cell type label 3}
+table(monaco.main$pruned.labels)
+table(hpca.main$pruned.labels)
+table(dice.main$pruned.labels)
+#The finer cell types annotations are you after, the harder they are to get reliably. This is where comparing many databases, as well as using individual markers from literature, would all be very valuable.
+table(monaco.fine$pruned.labels)
+table(hpca.fine$pruned.labels)
+table(dice.fine$pruned.labels)
+
+#Let's add the annotations to the Seurat object metadata so we can use them: 
+srat@meta.data$monaco.main <- monaco.main$pruned.labels
+srat@meta.data$monaco.fine <- monaco.fine$pruned.labels
+srat@meta.data$hpca.main   <- hpca.main$pruned.labels
+srat@meta.data$dice.main   <- dice.main$pruned.labels
+srat@meta.data$hpca.fine   <- hpca.fine$pruned.labels
+srat@meta.data$dice.fine   <- dice.fine$pruned.labels
+
+setwd(wd)
+saveRDS(srat, file = "Mg_SCT.rds")
+```
+
+Finally, let's visualize the fine-grained annotations.
+
+```{r cell type label 4}
+srat <- SetIdent(srat, value = "dice.fine")
+setwd(wd)
+tiff("UMAP_dice_fine.tiff", width=1000, height=1000, res=120)
+DimPlot(srat, label = T , repel = T, label.size = 3) + NoLegend()
+dev.off()
+```
+
+A detailed book on how to do cell type assignment / label transfer with `singleR` [is available](https://bioconductor.org/books/3.12/SingleRBook/).
+
+```{r ProjecTILs 1: set up reference dataset}
+if (!requireNamespace("remotes")) install.packages("remotes")
+library(remotes)
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+if (!requireNamespace("Seurat", quietly = TRUE)) {
+   install.packages("Seurat")
+}
+
+if (!requireNamespace("TILPRED", quietly = TRUE)) {
+  install.packages(c("doParallel","doRNG"))
+  BiocManager::install(c("AUCell","SingleCellExperiment"))
+  remotes::install_github("carmonalab/TILPRED")
+}
+
+#remotes::install_github("carmonalab/ProjecTILs")
+install.packages("/Users/jiapei/Desktop/single_cell_analysis/external_data/ProjecTILs", repos = NULL, type="source") #install from source
+library(ProjecTILs)
+
+# load reference object (onto which data will be projected)
+#wd <- "/Users/jiapei/Desktop/single_cell_analysis/external_data"
+#setwd(wd); ref <- load.reference.map() #sample data
+ref_mg <- load.reference.map("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/mg_prcomp.rds")
+#ref_mg <- load.reference.map("//Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/by_sample/scvelo_mg_sample.rds")
+DefaultAssay(ref_mg) <- "RNA"
+ref_mg$functional.cluster <- ref_mg$celltype
+
+# re-compute PCA embeddings outside of Seurat
+set.seed(1234)
+which.assay="integrated"
+varfeat <- ref_mg@assays[[which.assay]]@var.features
+refdata <- data.frame(t(ref_mg@assays[[which.assay]]@data[varfeat,]))
+refdata <- refdata[, sort(colnames(refdata))]
+ref.pca <- prcomp(refdata, rank. = 50, scale. = TRUE, center = TRUE, retx=TRUE)
+ref.pca$rotation[1:5,1:5]
+#ref.pca.seurat <- Loadings(object = ref_mg, reduction = "pca")
+
+# re-compute UMAP outside of Seurat
+library(umap)
+seed=1234
+n.neighbors=30
+min.dist=0.2
+metric="cosine"
+ndim=15
+umap.config <- umap.defaults
+umap.config$n_neighbors = n.neighbors
+umap.config$min_dist = min.dist
+umap.config$metric = metric
+umap.config$n_components = 2
+umap.config$random_state = seed
+umap.config$transform_state = seed
+ref.umap <- umap(ref_mg@misc$pca_object$x[,1:ndim], config=umap.config)
+colnames(ref.umap$layout) <- c("UMAP_1","UMAP_2")
+ref.umap
+
+# replace Seurat obj parameters (UMAP will be different...)
+ref_mg@reductions$umap@cell.embeddings <- ref.umap$layout # don't change this? ###
+ref.umap$layout <- ref_mg@reductions$umap@cell.embeddings # keep UMAP coordinates the same
+ref_mg@reductions$pca@cell.embeddings <- ref.pca$x
+ref_mg@reductions$pca@feature.loadings <- ref.pca$rotation
+colnames(ref_mg@reductions$pca@cell.embeddings) <- gsub("PC(\\d+)", "PC_\\1", colnames(ref.pca$x), perl=TRUE)
+colnames(ref_mg@reductions$pca@feature.loadings) <- gsub("PC(\\d+)", "PC_\\1", colnames(ref.pca$rotation), perl=TRUE)
+
+#Store the complete PCA and UMAP object in @misc
+ref_mg@misc$pca_object <- ref.pca
+ref_mg@misc$umap_object <- ref.umap ###
+ref_mg@misc$projecTILs="custom_atlas"
+
+DimPlot(ref_mg, reduction = "umap", pt.size = 0.5, group.by = "celltype") # check new UMAP
+
+wd <- "/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg" # save new object (prcomp and umap steps take long to run)
+setwd(wd)
+saveRDS(ref_mg, file = "mg_prcomp.rds")
+```
+
+```{r ProjecTILs 2: load query dataset and make projection}
+# load query object
+##Seurat object
+querydata_mg <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/by_sample/scvelo_mg_sample.rds")
+#querydata_mg  <- subset(x = querydata_mg, subset = celltype == "8 Neuron-assoc MG")
+DefaultAssay(querydata_mg) <- "RNA"
+
+##10X format
+fname2 <- "./sample_data"
+querydata2 <- read.sc.query(fname2, type="10x")
+
+##Raw count matrix from GEO
+library(GEOquery)
+geo_acc <- "GSE86028"
+getGEOSuppFiles(geo_acc)
+fname3 <- sprintf("%s/GSE86028_TILs_sc_wt_mtko.tpm.log2.txt.gz", geo_acc)
+querydata3 <- read.sc.query(fname3, type = "raw.log2")
+
+# convert mouse genes into human
+musGenes <- rownames(querydata_mg)
+# Basic function to convert mouse to human gene names
+convertMouseGeneList <- function(x){
+  require("biomaRt")
+  human = useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+  mouse = useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+  genesV2 = getLDS(attributes = c("mgi_symbol"), filters = "mgi_symbol", values = x , mart = mouse, attributesL = c("hgnc_symbol"), 
+                   martL = human, uniqueRows=T)
+  #humanx <- unique(genesV2[, 2])
+  return(genesV2)
+}
+
+MGI_HGNC <- convertMouseGeneList(musGenes)
+#take out duplicated mouse and human genes
+humanGenes_unique <- unique(MGI_HGNC$HGNC.symbol)
+index_unique <- match(humanGenes_unique, MGI_HGNC$HGNC.symbol)
+MGI_HGNC <- MGI_HGNC[index_unique,]
+
+musGenes_unique <- unique(MGI_HGNC$MGI.symbol)
+index_unique <- match(musGenes_unique, MGI_HGNC$MGI.symbol)
+MGI_HGNC <- MGI_HGNC[index_unique,]
+
+keep <- match(MGI_HGNC$MGI.symbol, musGenes)
+#subset query data to keep features to mouse genes with equivalent human genes
+counts <- GetAssayData(querydata_mg, assay = "RNA")
+counts <- counts[keep,]
+querydata_mg_human <- subset(querydata_mg, features = rownames(counts))
+#modify subsetted query data's RNA assay with human gene symbols
+RNA <- querydata_mg_human@assays$RNA
+newname_index <- match(RNA@counts@Dimnames[[1]], MGI_HGNC$MGI.symbol)
+newname <- MGI_HGNC[newname_index,]$HGNC.symbol
+RNA@counts@Dimnames[[1]] <- newname
+RNA@data@Dimnames[[1]] <- newname
+querydata_mg_human@assays$RNA <- RNA
+#RNA@counts@Dimnames[[1]] %>% head(3)
+#n_occur <- data.frame(table(keep))
+#n_occur<- n_occur[n_occur$Freq > 1,]
+
+# make projection
+#query.list <- SplitObject(querydata_mg, split.by = "orig.ident")
+query.projected_mg <- make.projection(querydata_mg, ref = ref_mg, filter.cells = F, query.assay = "RNA", human.ortho = F) #don't filter for T cells; had to change raw code to make sure human.ortho = FALSE (otherwise "too many genes missing" error)
+
+setwd(wd)
+tiff("projection.tiff", width=1000, height=1000, res=120)
+plot.projection(ref_mg, query.projected_mg, cols=colors)
+dev.off()
+```
+
+```{r ProjecTILs 3: cell state prediction}
+query.projected_mg <- cellstate.predict(ref=ref_mg, query=query.projected_mg)
+table(query.projected_mg$functional.cluster)
+
+setwd(wd)
+tiff("cellstate_perc.tiff", width=800, height=800, res=120)
+plot.statepred.composition(ref_mg, query.projected_mg, metric = "Percent") + 
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(), panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"))
+  #+ geom_bar(stat="identity", fill=colors)
+dev.off()
+
+genes4radar <- c("CX3CR1","CCL2","SPP1","GPNMB","MKI67","TOP2A","CLDN5","MFSD2A","LYZ","S100A9","STMN2","DCX")
+
+setwd(wd)
+tiff("cellstate_radar.tiff", width=1500, height=1500, res=120)
+plot.states.radar(ref_mg, query=query.projected_mg, min.cells = 20, genes4radar = genes4radar)
+dev.off()
+```
+
+## Weighted gene coexpression network analysis (WGCNA)
+https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Rpackages/WGCNA/  
+```{r WGCNA 1: load, clean datasets}
+#BiocManager::install("WGCNA")
+library(WGCNA)
+options(stringsAsFactors = FALSE)
+
+wd <- "/Users/jiapei/Desktop/single_cell_analysis/WGCNA"
+#example data set
+setwd(wd)
+femData <- read.csv("FemaleLiver_Data/LiverFemale3600.csv")
+dim(femData)
+names(femData)
+
+# Remove excess data
+datExpr0 = as.data.frame(t(femData[, -c(1:8)]))
+names(datExpr0) = femData$substanceBXH
+rownames(datExpr0) = names(femData)[-c(1:8)]
+# remove genes and samples with too many missing values
+gsg = goodSamplesGenes(datExpr0, verbose = 3)
+gsg$allOK
+# if prev statement did not return TRUE:
+if (!gsg$allOK)
+{# print the gene and sample names that were removed:
+  if (sum(!gsg$goodGenes)>0)
+  printFlush(paste("Removing genes:", paste(names(datExpr0)[!gsg$goodGenes], collapse = ", ")));
+  if (sum(!gsg$goodSamples)>0)
+  printFlush(paste("Removing samples:", paste(rownames(datExpr0)[!gsg$goodSamples], collapse = ", ")));
+  # Remove the offending genes and samples from the data:
+  datExpr0 = datExpr0[gsg$goodSamples, gsg$goodGenes]
+}
+
+# cluster samples and find outlier
+sampleTree = hclust(dist(datExpr0), method = "average");
+sizeGrWindow(12,9)
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub="", xlab="", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+abline(h = 15, col = "red")# Plot a line to show the cut (i.e. threshold for outlier cutoff, user can arbitrarily define)
+# Determine the outlier sample
+clust = cutreeStatic(sampleTree, cutHeight = 15, minSize = 10)
+table(clust)
+# refine dataset to exclude the outlier
+keepSamples = (clust==1)
+datExpr = datExpr0[keepSamples, ]
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+
+# input clinical data on each sample (similar to sample sheet in bulk RNAseq analyses)
+setwd(wd)
+traitData = read.csv("FemaleLiver_Data/ClinicalTraits.csv")
+dim(traitData)
+names(traitData)
+# remove columns that hold information we do not need.
+allTraits = traitData[, -c(31, 16)]
+allTraits = allTraits[, c(2, 11:36) ]
+dim(allTraits)
+names(allTraits)
+# Form a data frame analogous to expression data that will hold the clinical traits.
+femaleSamples = rownames(datExpr)
+traitRows = match(femaleSamples, allTraits$Mice)
+datTraits = allTraits[traitRows, -1]
+rownames(datTraits) = allTraits[traitRows, 1]
+collectGarbage()
+
+# expression data is now in datExpr, and the corresponding clinical traits in datTraits
+# Re-cluster samples
+sampleTree2 = hclust(dist(datExpr), method = "average")
+# Convert traits to a color representation: white means low, red means high, grey means missing entry
+traitColors = numbers2colors(datTraits, signed = FALSE);
+# Plot the sample dendrogram and the colors underneath.
+plotDendroAndColors(sampleTree2, traitColors, groupLabels = names(datTraits), main = "Sample dendrogram and trait heatmap")
+
+# save 
+setwd(wd)
+save(datExpr, datTraits, file = "FemaleLiver-01-dataInput.RData")
+```
+
+```{r WGCNA 2: network construction and module detection}
+options(stringsAsFactors = FALSE)
+
+## Method 1: 1-step
+
+# Load the data saved in the first part
+setwd(wd)
+lnames = load(file = "FemaleLiver-01-dataInput.RData")
+#The variable lnames contains the names of loaded variables
+lnames
+
+# Define a range of values for soft-thresholding power (important parameter)
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+# Call the network topology analysis function
+sft = pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+# Plot the results:
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2))
+cex1 = 0.9
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], 
+     xlab="Soft Threshold (power)", ylab="Scale Free Topology Model Fit,signed R^2", type="n", main = paste("Scale independence"))
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2], labels=powers, cex=cex1, col="red")
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.90, col="red")
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5], xlab="Soft Threshold (power)", ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+# pick soft-threshold power of 6 (scale free topology model result flattens out after 6, see first graph)
+
+# one-step function
+setwd(wd)
+net = blockwiseModules(datExpr, power = 6, TOMType = "unsigned", minModuleSize = 30, reassignThreshold = 0, mergeCutHeight = 0.25, 
+                       numericLabels = T, pamRespectsDendro = F, saveTOMs = T, saveTOMFileBase = "femaleMouseTOM", verbose = 3)
+# paramter settings:
+  #relatively large minimum module size of 30; mergeCutHeight is threshold for module merging; function returns numeric, rather than color, labels for modules; save Topological Overlap Matrix (TOM) = T
+# function output:
+  # net$colors contains module assignment; net$MEs contains module eigengenes
+# We encourage the user to read the help file and play with parameter values. 
+# maxBlockSize: size of largest block that the computer can handle. Default value: 5000. If dataset > 5000 probes, blockwiseModules will split dataset into several blocks. This will break some of the plotting code below. 
+# For larger datasets: increase maxBlockSize
+  #16GB workstation can handle 20000 probes; 32GB workstation can handle 30000. 4GB can handle 8000-10000
+
+#To see how many modules were identified and what the module sizes are:
+table(net$colors) #in order of descending size; label 0 is reserved for genes outside of all modules
+
+# open a graphics window
+sizeGrWindow(12, 9)
+# Convert labels to colors for plotting
+mergedColors = labels2colors(net$colors)
+# Plot the dendrogram and the module colors underneath
+plotDendroAndColors(net$dendrograms[[1]], mergedColors[net$blockGenes[[1]]], "Module colors", dendroLabels = F, hang = 0.03,
+                    addGuide = T, guideHang = 0.05)
+# function recutBlockwiseTrees can recut the dendrogram tree without recomputing the network and clustering
+
+# save the module assignment and module eigengene information
+moduleLabels = net$colors
+moduleColors = labels2colors(net$colors)
+MEs = net$MEs
+geneTree = net$dendrograms[[1]]
+setwd(wd)
+save(MEs, moduleLabels, moduleColors, geneTree, file = "FemaleLiver-02-networkConstruction-auto.RData")
+
+## Method 2: step-by-step
+
+# first run the soft-thresholding power block from method 1 (see above) -> select appropriate soft-threshold value
+softPower = 6
+adjacency = adjacency(datExpr, power = softPower)
+# Turn adjacency into topological overlap
+TOM = TOMsimilarity(adjacency)
+dissTOM = 1-TOM
+# Call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM), method = "average")
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity", labels = FALSE, hang = 0.04)
+
+# There are many methods for branch cutting; our standard method is the Dynamic Tree Cut (dynamicTreeCut)
+# We like large modules, so we set minimum module size relatively high:
+minModuleSize = 30
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM, deepSplit = 2, pamRespectsDendro = F, minClusterSize = minModuleSize)
+table(dynamicMods) # list modules from largest to smallest size; module 0 are genes outside of all modules
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut", dendroLabels = F, hang = 0.03, addGuide = T, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+
+# Calculate eigengenes
+MEList = moduleEigengenes(datExpr, colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs)
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average")
+# Plot the result
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes", xlab = "", sub = "")
+# choose height cut of 0.25 (= correlation of 0.75)
+MEDissThres = 0.25
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+
+# Call an automatic merging function
+merge = mergeCloseModules(datExpr, dynamicColors, cutHeight = MEDissThres, verbose = 3)
+# The merged module colors
+mergedColors = merge$colors
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs
+# plot dendrogram with original and merged modules underneath
+sizeGrWindow(12, 9)
+#pdf(file = "Plots/geneDendro-3.pdf", wi = 9, he = 6)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors), c("Dynamic Tree Cut", "Merged dynamic"), dendroLabels = F, 
+                    hang = 0.03, addGuide = T, guideHang = 0.05)
+#dev.off()
+
+# save data (with merged modules)
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50))
+moduleLabels = match(moduleColors, colorOrder)-1
+MEs = mergedMEs
+# Save module colors and labels for use in subsequent parts
+setwd(wd)
+save(MEs, moduleLabels, moduleColors, geneTree, file = "FemaleLiver-02-networkConstruction-stepByStep.RData")
+
+## Method 3: block-wise, for large datasets (although preferable: analyze dataset in 1 block)
+
+# first run the soft-thresholding power block from method 1 (see above) -> select appropriate soft-threshold value
+# Let's assume that hardware restricts us to analyze 2000 genes at one time. The basic idea is to use a two-level clustering. 
+  # First, we use a fast and crude clustering method to pre-cluster genes into size ~ 2000 genes. 
+  # We then perform a full network analysis in each block separately. 
+  # At the end, modules whose eigengenes are highly correlated are merged. 
+# Advantages: smaller memory req and faster calculations
+# Trade-off: modules may not be optimal
+# blockwiseModules can split datasets into blocks automatically; just need to specify largest number of genes to fit in a block:
+setwd(wd)
+bwnet = blockwiseModules(datExpr, maxBlockSize = 2000, power = 6, TOMType = "unsigned", minModuleSize = 30, reassignThreshold = 0,
+                         mergeCutHeight = 0.25, numericLabels = T, saveTOMs = T, saveTOMFileBase = "femaleMouseTOM-blockwise",
+                         verbose = 3)
+# Relabel block-wise module labels so that modules with significant overlap with single-block modules have the same label:
+# Load the results of single-block analysis
+setwd(wd)
+load(file = "FemaleLiver-02-networkConstruction-auto.RData")
+# Relabel blockwise modules
+bwLabels = matchLabels(bwnet$colors, moduleLabels)
+# Convert labels to colors for plotting
+bwModuleColors = labels2colors(bwLabels)
+table(bwLabels)
+
+# Graph dendrogram
+sizeGrWindow(6,6)
+# Plot the dendrogram and the module colors underneath for block 1
+plotDendroAndColors(bwnet$dendrograms[[1]], bwModuleColors[bwnet$blockGenes[[1]]], "Module colors", 
+                    main = "Gene dendrogram and module colors in block 1", dendroLabels = F, hang = 0.03, addGuide = T, guideHang = 0.05)
+# Plot the dendrogram and the module colors underneath for block 2
+plotDendroAndColors(bwnet$dendrograms[[2]], bwModuleColors[bwnet$blockGenes[[2]]], "Module colors", 
+                    main = "Gene dendrogram and module colors in block 2", dendroLabels = F, hang = 0.03, addGuide = T, guideHang = 0.05)
+
+# Compare results of block-wise analysis to the results from method 1 (all data analyzed in a single block(. A simple visual check:
+sizeGrWindow(12,9)
+plotDendroAndColors(geneTree, cbind(moduleColors, bwModuleColors), c("Single block", "2 blocks"),
+                    main = "Single block gene dendrogram and module colors", dendroLabels = F, hang = 0.03, 
+                    addGuide = T, guideHang = 0.05)
+
+# Verify that module eigengenes in the single-block and block-wise approaches are similar
+# We first calculate module eigengenes based on the single block and block-wise module colors:
+singleBlockMEs = moduleEigengenes(datExpr, moduleColors)$eigengenes
+blockwiseMEs = moduleEigengenes(datExpr, bwModuleColors)$eigengenes
+# Next we match the single-block and block-wise eigengenes by name and calculate the correlations of the corresponding eigengenes:
+single2blockwise = match(names(singleBlockMEs), names(blockwiseMEs))
+signif(diag(cor(blockwiseMEs[, single2blockwise], singleBlockMEs)), 3)
+```
+
+```{r WGCNA 3: add external info and ID genes}
+# The following setting is important, do not omit
+options(stringsAsFactors = FALSE)
+# Load the expression and trait data saved in the first part
+setwd(wd)
+lnames = load(file = "FemaleLiver-01-dataInput.RData")
+#The variable lnames contains the names of loaded variables.
+lnames
+# Load network data saved in the second part
+setwd(wd)
+lnames = load(file = "FemaleLiver-02-networkConstruction-auto.RData");
+lnames
+
+#Identify modules sig associated with traits: correlate eigengenes with external traits and look for the most significant ones:
+# Define numbers of genes and samples
+nGenes = ncol(datExpr)
+nSamples = nrow(datExpr)
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, datTraits, use = "p")
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+# Color code each association by correlation value:
+sizeGrWindow(10,6)
+# Will display correlations and their p-values
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPvalue, 1), ")", sep = "")
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(6, 8.5, 3, 3))
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = moduleTraitCor, xLabels = names(datTraits), yLabels = names(MEs), ySymbols = names(MEs), colorLabels = F,
+               colors = greenWhiteRed(50), textMatrix = textMatrix, setStdMargins = F, cex.text = 0.5, zlim = c(-1,1),
+               main = paste("Module-trait relationships"))
+
+# Quantify associations of individual genes with our trait of interest (weight) by defining Gene Significance (GS) as absolute value of correlation between gene and trait
+# For each module, we also define module membership (MM) as correlation of module eigengene and gene expression profile. This allows us to quantify the similarity of all genes on the array to every module.
+# Define variable weight containing the weight column of datTrait
+weight = as.data.frame(datTraits$weight_g)
+names(weight) = "weight"
+# names (colors) of the modules
+modNames = substring(names(MEs), 3)
+geneModuleMembership = as.data.frame(cor(datExpr, MEs, use = "p"))
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(geneModuleMembership), nSamples))
+names(geneModuleMembership) = paste("MM", modNames, sep="")
+names(MMPvalue) = paste("p.MM", modNames, sep="")
+geneTraitSignificance = as.data.frame(cor(datExpr, weight, use = "p"))
+GSPvalue = as.data.frame(corPvalueStudent(as.matrix(geneTraitSignificance), nSamples))
+names(geneTraitSignificance) = paste("GS.", names(weight), sep="")
+names(GSPvalue) = paste("p.GS.", names(weight), sep="")
+
+# Using GS and MM, we can identify genes that have high significance for weight as well as high MM in interesting modules. As an example, we look at the brown module that has the highest association with weight. We plot a scatterplot of GS vs. MM in the brown module:
+module = "brown"
+column = match(module, modNames)
+moduleGenes = moduleColors==module
+sizeGrWindow(7, 7)
+par(mfrow = c(1,1))
+verboseScatterplot(abs(geneModuleMembership[moduleGenes, column]), abs(geneTraitSignificance[moduleGenes, 1]), 
+                   xlab = paste("Module Membership in", module, "module"), ylab = "Gene significance for body weight",
+                   main = paste("Module membership vs. gene significance\n"), cex.main = 1.2, cex.lab = 1.2, cex.axis = 1.2, 
+                   col = module)
+# GS and MM are highly correlated: genes highly associated with a trait = most important elements of modules associated with that trait
+
+# Merge statistical information with gene annotation and write out a file that summarizes the most important results and can be inspected in Excel. Our expression data are only annotated by probe ID names:
+names(datExpr) # return all probe IDs included in the analysis
+names(datExpr)[moduleColors=="brown"] #return probe IDs belonging to the brown module. 
+# Load probe annotation file provided by the manufacturer of expression arrays to connect probe IDs to gene names and Entrez codes
+setwd("/Users/jiapei/Desktop/single_cell_analysis/WGCNA/FemaleLiver_Data")
+annot = read.csv(file = "GeneAnnotation.csv")
+dim(annot)
+names(annot)
+probes = names(datExpr)
+probes2annot = match(probes, annot$substanceBXH)
+# The following is the number or probes without annotation:
+sum(is.na(probes2annot)) # Should return 0
+
+# Create data frame with: probe ID, gene symbol, Entrez code, module color, GS for weight, MM and p-values 
+# Modules will be ordered by their significance for weight, with the most significant ones to the left
+geneInfo0 = data.frame(substanceBXH = probes, geneSymbol = annot$gene_symbol[probes2annot],
+                       LocusLinkID = annot$LocusLinkID[probes2annot], moduleColor = moduleColors, geneTraitSignificance, GSPvalue)
+modOrder = order(-abs(cor(MEs, weight, use = "p")))
+# Add module membership information in the chosen order
+for (mod in 1:ncol(geneModuleMembership))
+{
+  oldNames = names(geneInfo0)
+  geneInfo0 = data.frame(geneInfo0, geneModuleMembership[, modOrder[mod]], MMPvalue[, modOrder[mod]])
+  names(geneInfo0) = c(oldNames, paste("MM.", modNames[modOrder[mod]], sep=""), paste("p.MM.", modNames[modOrder[mod]], sep=""))
+}
+# Order the genes in geneInfo variable first by module color, then by geneTraitSignificance
+geneOrder = order(geneInfo0$moduleColor, -abs(geneInfo0$GS.weight))
+geneInfo = geneInfo0[geneOrder, ]
+
+# save
+setwd(wd)
+write.csv(geneInfo, file = "geneInfo.csv")
+# inspect it directly within R using the command fix(geneInfo).
+```
+
+```{r WGCNA 4: GO}
+# The following setting is important, do not omit
+options(stringsAsFactors = FALSE)
+# Load the expression and trait data saved in the first part
+lnames = load(file = "FemaleLiver-01-dataInput.RData")
+#The variable lnames contains the names of loaded variables.
+lnames
+# Load network data saved in the second part
+lnames = load(file = "FemaleLiver-02-networkConstruction-auto.RData");
+lnames
+
+# Export gene identifiers for GO and functional enrichment analyses, e.g. we output Entrez codes from brown module into a file:
+# Read in probe annotation
+setwd("/Users/jiapei/Desktop/single_cell_analysis/WGCNA/FemaleLiver_Data")
+annot = read.csv(file = "GeneAnnotation.csv")
+# Match probes in the data set to the probe IDs in the annotation file
+probes = names(datExpr)
+probes2annot = match(probes, annot$substanceBXH)
+# Get the corresponding Locuis Link IDs (Entrez codes)
+allLLIDs = annot$LocusLinkID[probes2annot]
+# Choose interesting modules
+intModules = c("brown", "red", "salmon")
+for (module in intModules)
+{
+  # Select module probes
+  modGenes = (moduleColors==module)
+  # Get their entrez ID codes
+  modLLIDs = allLLIDs[modGenes]
+  # Write them into a file
+  fileName = paste("LocusLinkIDs-", module, ".txt", sep="")
+  setwd(wd)
+  write.table(as.data.frame(modLLIDs), file = fileName, row.names = F, col.names = F)
+}
+# As background in the enrichment analysis, we will use all probes in the analysis
+fileName = paste("LocusLinkIDs-all.txt", sep="")
+setwd(wd)
+write.table(as.data.frame(allLLIDs), file = fileName, row.names = F, col.names = F)
+
+# WGCNA can perform GO enrichment analysis
+# Calling the GO enrichment analysis function GOenrichmentAnalysis is very simple. The function takes a vector of module labels, and the Entrez (a.k.a. Locus Link) codes for the genes whose labels are given.
+if (!requireNamespace("BiocManager", quietly = T))
+    install.packages("BiocManager")
+BiocManager::install("GO.db")
+if (!requireNamespace("BiocManager", quietly = T))
+    install.packages("BiocManager")
+BiocManager::install("AnnotationDBI")
+if (!requireNamespace("BiocManager", quietly = T))
+    install.packages("BiocManager")
+BiocManager::install("org.Hs.eg.db")
+library("GO.db")
+library("AnnotationDBI")
+library("org.Hs.eg.db")
+
+GOenr = GOenrichmentAnalysis(moduleColors, allLLIDs, organism = "mouse", nBestP = 10)
+tab = GOenr$bestPTerms[[4]]$enrichment # enrichment table containing the 10 best terms for each module present in moduleColors. Names of the columns within the table can be accessed by
+names(tab)
+```
+
+```{r slingshot}
+#if (!requireNamespace("BiocManager", quietly=TRUE))
+#    install.packages("BiocManager")
+#BiocManager::install("kstreet13/slingshot")
+#BiocManager::install("SingleCellExperiment")
+
+library(slingshot)
+library(SingleCellExperiment)
+
+object <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/by_sample/scvelo_mg_sample.rds")
+count_raw_2 <- as.matrix(GetAssayData(object, slot = "counts"))
+#head(colnames(count_raw_2),3)
+sce <- SingleCellExperiment(assays = List(counts = count_raw_2)) #count_raw imported from Seurat object of choice
+rm(object) 
+rm(count_raw) #save space
+
+# gene filtering
+geneFilter <- apply(assays(sce)$counts,1,function(x){
+    sum(x >= 3) >= 10
+}) # filtering to include only genes with > 3 counts in more than 10 cells
+sce <- sce[geneFilter, ]
+
+# normalization (does NOT include batch correction, is basically full quantile normalization to ensure same distribution of expression values for each cell)
+FQnorm <- function(counts){
+    rk <- apply(counts,2,rank,ties.method='min')
+    counts.sort <- apply(counts,2,sort)
+    refdist <- apply(counts.sort,1,median)
+    norm <- apply(rk,2,function(r){ refdist[r] })
+    rownames(norm) <- rownames(counts)
+    return(norm)
+}
+assays(sce)$norm <- FQnorm(assays(sce)$counts)
+
+# save SCE object
+setwd(wd)
+saveRDS(sce, file = "slingshot_sce.rds")
+
+# dimension reduction (PCA)
+#sce <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/ctrl_Mg/by_sample/slingshot/slingshot_sce.rds")
+pca <- prcomp(t(log1p(assays(sce)$norm)), scale. = F)
+rd1 <- pca$x[,1:2]
+plot(rd1, col = rgb(0,0,0,.5), pch=16, asp = 1)
+
+# dimension reduction (UMAP)
+library(uwot)
+```
+
+```{r cellchat}
+# Source: https://htmlpreview.github.io/?https://github.com/sqjin/CellChat/blob/master/tutorial/CellChat-vignette.html 
+## Install and read packages ##
+#devtools::install_github("sqjin/CellChat")
+library(CellChat)
+library(patchwork)
+options(stringsAsFactors = FALSE)
+
+## Input Data ##
+# Gene expression of cells: genes should be in rows with rownames and cells in columns with colnames. Normalized data (e.g., library-size normalization and then log-transformed with a pseudocount of 1) is required as input for CellChat analysis. If user provides count data, we provide a normalizeData function to account for library size and then do log-transformed.
+# User assigned cell labels: a data frame (rows = cells) consisting of cell labels, which will be used for defining cell groups.
+object <- readRDS("/Users/jiapei/Desktop/single_cell_analysis/ctrl_MgEndo/MgEndo.rds")
+data.input <- GetAssayData(object, slot = "data", assay = "SCT") # normalized data matrix
+Idents(object) <- "cell_type"
+meta <- data.frame(labels = Idents(object), row.names = names(Idents(object))) # manually create a dataframe with cell labels
+unique(meta$labels) # check cell labels
+
+## Create CellChat object ##
+cellchat <- createCellChat(object = data.input, meta = meta, group.by = "labels")
+cellchat
+levels(cellchat@idents) # show factor levels of the cell labels
+groupSize <- as.numeric(table(cellchat@idents)) # number of cells in each cell group
+
+## Set ligand-receptor database ##
+# CellChatDB: manually curated database of literature-supported ligand-receptor interactions in human and mouse. CellChatDB in mouse contains 2,021 interactions: 60% secrete autocrine/paracrine, 21% ECM-receptor and 19% cell-cell contact CellChatDB in human contains 1,939 interactions: 62% paracrine/autocrine, 22% ECM-receptor and 17% cell-cell contact.
+# Users can update CellChatDB by adding their own curated ligand-receptor pairs. Please check our tutorial on how to do it.
+showDatabaseCategory(CellChatDB.human) # CellChatDB.mouse 
+# Show the structure of the database
+dplyr::glimpse(CellChatDB.human$interaction)
+#cellchat@DB <- subsetDB(CellChatDB.human, search = "Secreted Signaling") # use a subset of CellChatDB for cell-cell communication analysis
+cellchat@DB <- CellChatDB.human # set the used database in the object
+
+## Preprocessing expression data ##
+# We find over-expressed ligands or receptors in one cell group and then find over-expressed ligand-receptor interactions if either ligand or receptor is over-expressed.
+# We also provide a function to project gene expression data onto protein-protein interaction (PPI) network. Specifically, a diffusion process is used to smooth genes’ expression values based on their neighbors’ defined in a high-confidence experimentally validated protein-protein network. This function is useful when analyzing single-cell data with shallow sequencing depth because the projection reduces the dropout effects of signaling genes, in particular for possible zero expression of subunits of ligands/receptors. USERS can skip this step and set raw.use = TRUE in the function computeCommunProb().
+cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+future::plan("multiprocess", workers = 4) # do parallel
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+ 
+# project gene expression data onto PPI (Optional: when running it, USER should set `raw.use = FALSE` in the function `computeCommunProb()` in order to use the projected data)
+cellchat <- projectData(cellchat, PPI.human)
+
+## Compute communication probability and infer communication network ##
+# CellChat infers biologically significant cell-cell communication by assigning each interaction with a probability value and peforming a permutation test. CellChat models the probability of cell-cell communication by integrating gene expression with spatial locations as well as prior known knowledge of the interactions between signaling ligands, receptors and their cofactors using the law of mass action.
+
+# In computeCommunProb, users can use different methods to calculate average gene expression. ‘trimean’ default: 25% truncated mean (average gene expression is 0 if <25% cells in a group express this gene). To use 10% truncated mean: type = "truncatedMean" and trim = 0.1. 
+# The function computeAveExpr can check average expression of genes of interest, e.g, computeAveExpr(cellchat, features = c("CXCL12","CXCR4"), type =  "truncatedMean", trim = 0.1).
+# If well-known signaling pathways are not predicted, USER can lower trim value.
+
+# To quickly examine the inference results, USER can set nboot = 20. i.e. “pvalue < 0.05” means none of the permutation results are larger than the observed communication probability.
+
+? computeCommunProb
+cellchat <- computeCommunProb(cellchat, type = "truncatedMean", trim = 0.1, raw.use = T)
+# options(future.globals.maxSize = 1000 * 1024^2) # error debugging; see: https://satijalab.org/seurat/archive/v3.0/future_vignette.html
+# raw.use: use raw data ('object@data.signaling') or projected data ('object@data.project'). Set raw.use = F to use projected data when analyzing single-cell data with shallow sequencing depth because projected data reduce dropout effects of signaling genes.
+
+## Filter out interactions in few cells ##
+cellchat <- filterCommunication(cellchat, min.cells = 10)
+
+## Extract inferred cellular communication network as a data frame ##
+df.net <- subsetCommunication(cellchat, sources.use = c("6 HLA+ My"), targets.use = c("Mitotic","Venous","Arterial","Capillary","Tip"),
+                              slot.name = "netP") # slot.name = "net" (LR pairs), signaling = c("TGFb")
+
+## Infer cell-cell communication at signaling pathway level ##
+# Inferred communication network of ligand-receptor pairs and signaling pathways is stored in the slot ‘net’ and ‘netP’, respectively.
+cellchat <- computeCommunProbPathway(cellchat)
+
+## Calculate aggregated cell-cell communication network ##
+# by counting number of links or summarizing communication probability. 
+cellchat <- aggregateNet(cellchat) #sources.use = c("6 HLA+ My"), targets.use = c("Mitotic")
+
+## Visualize cell-cell communication ##
+# Visualize: number of interactions or total interaction strength (weights) between any two cell groups using circle plot.
+setwd(wd)
+tiff("CellChat_NumInteraction.tiff", width=1200, height=1200, res=120)
+netVisual_circle(cellchat@net$count, vertex.weight = rowSums(cellchat@net$count), weight.scale = T, label.edge= F, 
+                 title.name = "Number of interactions")
+tiff("CellChat_Weight.tiff", width=1200, height=1200, res=120)
+netVisual_circle(cellchat@net$weight, vertex.weight = rowSums(cellchat@net$weight), weight.scale = T, label.edge= F, 
+                 title.name = "Interaction weights/strength")
+dev.off()
+
+# Examine signaling sent from each cell group. Here we control edge.weight.max so that we can compare edge weights between different networks.
+mat <- cellchat@net$weight
+setwd(wd)
+tiff("CellChat_celltype.tiff", width=2000, height=2000, res=120)
+par(mfrow = c(4,4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i])
+}
+dev.off()
+
+# Chord diagram: CellChat provides two functions netVisual_chord_cell and netVisual_chord_gene for visualizing cell-cell communication with different purposes and different levels. netVisual_chord_cell is used for visualizing the cell-cell communication between different cell groups (where each sector in the chord diagram is a cell group), and netVisual_chord_gene is used for visualizing the cell-cell communication mediated by mutiple ligand-receptors or signaling pathways (where each sector in the chord diagram is a ligand, receptor or signaling pathway.)
+
+# Explnations of edge color/weight, node color/size/shape: In all visualization plots, edge colors are consistent with the sources as sender, and edge weights are proportional to the interaction strength. Thicker edge line indicates a stronger signal. In the Hierarchy plot and Circle plot, circle sizes are proportional to the number of cells in each cell group. In the hierarchy plot, solid and open circles represent source and target, respectively. In the Chord diagram, the inner thinner bar colors represent the targets that receive signal from the corresponding outer bar. The inner bar size is proportional to the signal strength received by the targets. Such inner bar is helpful for interpreting the complex chord diagram. Note that there exist some inner bars without any chord for some cell groups, please just igore it because this is an issue that has not been addressed by circlize package.
+
+# Visualize network of signaling pathways using netVisual_aggregate, and visualize networks of LR pairs using netVisual_individual.
+cellchat@netP$pathways # All signaling pathways showing significant communications
+
+pathways.show <- c("CXCL") 
+# Hierarchy plot
+netVisual_aggregate(cellchat, signaling = c("IGF"), vertex.receiver = seq(1,5))
+# vertex.receiver: numeric vector giving the index of cell groups as targets in the left part of plot. This plot has two components: the left portion shows autocrine and paracrine signaling to cell groups of interest (i.e. vertex.receiver), and the right portion shows autocrine and paracrine signaling to the remaining cell groups. <- seems to just reorder cell groups, otherwise the same as circle plot (see below)
+
+# Circle Plot
+setwd(wd)
+tiff("CellChat_IL6.tiff", width=800, height=800, res=120)
+netVisual_aggregate(cellchat, signaling = c("IL6"), layout = "circle")
+dev.off()
+
+# Circle Plot for significant LR pair
+pairLR <- extractEnrichedLR(cellchat, signaling = c("CXCL"), geneLR.return = F) # extract all significant LR pairs and related genes
+LR.show <- pairLR[8,]; LR.show # show one ligand-receptor pair
+netVisual_individual(cellchat, signaling = c("CXCL"), pairLR.use = LR.show, layout = "circle") # layout = "chord"
+
+# Chord diagram
+setwd(wd)
+tiff("CellChat_IGF_chord.tiff", width=1000, height=1000, res=120)
+netVisual_aggregate(cellchat, signaling = c("IGF"), layout = "chord")
+dev.off()
+
+# Grouped Chord diagram
+# netVisual_chord_cell: can adjust different parameters in the circlize package. For example, we can group cell clusters into different groups
+levels(cellchat@idents)
+group.cellType <- c(rep("ENDO", 5), rep("CD45", 11)) # grouping cell clusters into endo or CD45+ cells
+names(group.cellType) <- levels(cellchat@idents)
+
+setwd(wd)
+tiff("CellChat_IGF_chord_celltype.tiff", width=1000, height=1000, res=120)
+netVisual_chord_cell(cellchat, signaling = c("IGF"), group = group.cellType, title.name = paste0(pathways.show, " signaling network"))
+dev.off()
+
+# LR pair Chord diagram
+levels(cellchat@idents)
+setwd(wd)
+tiff("CellChat_chord_IGF_VEGF.tiff", width=1500, height=1500, res=120)
+netVisual_chord_gene(cellchat, sources.use = c(13,15,16), targets.use = c(1:5), signaling = c("IGF","VEGF"), 
+                     lab.cex = 1, legend.pos.y = 30)
+dev.off()
+
+# Pathway Chord diagram
+# show all the significant signaling pathways
+setwd(wd)
+tiff("CellChat_chord_pathway.tiff", width=1500, height=1500, res=120)
+netVisual_chord_gene(cellchat, sources.use = c(13,15,16), targets.use = c(1:5), slot.name = "netP", legend.pos.x = 10)
+dev.off()
+
+# Heatmap
+setwd(wd)
+tiff("CellChat_VEGF_heatmap.tiff", width=1000, height=500, res=120)
+netVisual_heatmap(cellchat, signaling = c("VEGF"), color.heatmap = "Reds")
+dev.off()
+
+# Contribution of LR pair to the overall signaling pathway
+netAnalysis_contribution(cellchat, signaling = c("CXCL"))
+
+# Violin plots
+setwd(wd)
+tiff("CellChat_VlnPlot_VEGF.tiff", width=1000, height=800, res=120)
+plotGeneExpression(cellchat, signaling = "VEGF") # enriched.only = FALSE to show all genes
+dev.off()
+
+# Save ALL plots
+# Access all the signaling pathways showing significant communications
+pathways.show.all <- cellchat@netP$pathways
+for (i in 1:length(pathways.show.all)) {
+  # Visualize communication network associated with both signaling pathway and individual L-R pairs
+  netVisual(cellchat, signaling = pathways.show.all[i], layout = "circle")
+  # Compute and visualize the contribution of each ligand-receptor pair to the overall signaling pathway
+  gg <- netAnalysis_contribution(cellchat, signaling = pathways.show.all[i])
+  ggsave(filename=paste0(pathways.show.all[i], "_L-R_contribution.pdf"), plot=gg, width = 10, height = 10, units = 'in', dpi = 300)
+}
+
+# Visualize cell-cell communication by multiple LR or signaling pathways
+# Bubble plot
+# show all significant LR pairs from some cell groups ('sources.use') to other cell groups ('targets.use')
+setwd(wd)
+tiff("CellChat_bubble_IGF_VEGF.tiff", width=1000, height=500, res=120)
+netVisual_bubble(cellchat, sources.use = c(1:5), targets.use = c(6:16), signaling = c("IGF","VEGF"), remove.isolate = FALSE) # similar to cellphoneDB heatmap
+dev.off()
+
+## Systems analysis of cell-cell communication network ##
+# It can determine signaling sources, targets, mediators and influencers within a network using centrality measures from network analysis
+# It can predict incoming and outgoing signals for specific cell types as well as coordinated responses among different cell types by leveraging pattern recognition approaches.
+# It can group signaling pathways by similarity measures and performing manifold learning from functional and topological perspectives.
+# It can delineate conserved and context-specific signaling pathways by joint manifold learning of multiple networks.
+
+# Compute the network centrality scores
+cellchat <- netAnalysis_computeCentrality(cellchat, slot.name = "netP") # 'netP': network of signaling pathways
+# Visualize centrality scores using heatmap, allowing ready identification of major signaling roles of cell groups
+netAnalysis_signalingRole_network(cellchat, signaling = c("IGF"), width = 8, height = 2.5, font.size = 10)
+
+# Visualize dominant senders (sources) and receivers (targets) in scatterplot
+# Signaling role analysis on aggregated network from all signaling pathways
+setwd(wd)
+tiff("CellChat_ScatterPlot_IGF_VEGF.tiff", width=500, height=500, res=120)
+netAnalysis_signalingRole_scatter(cellchat, signaling = c("IGF", "VEGF")) # Signaling role analysis on networks of interest
+dev.off()
+
+# Identify signals contributing most to outgoing or incoming signaling
+setwd(wd)
+tiff("CellChat_Outgoing_IGF_VEGF.tiff", width=1000, height=800, res=120)
+netAnalysis_signalingRole_heatmap(cellchat, pattern = "outgoing", signaling = c("IGF", "VEGF"))
+tiff("CellChat_Incomingt_IGF_VEGF.tiff", width=1000, height=800, res=120)
+netAnalysis_signalingRole_heatmap(cellchat, pattern = "incoming", signaling = c("IGF", "VEGF"))
+dev.off()
+
+# Identify global communication patterns to explore how multiple cell types and signaling pathways coordinate together
+
+# As the number of patterns increases, there might be redundant patterns, making it difficult to interpret. We chose five patterns as default. Generally, it is biologically meaningful with number of patterns > 2. In addition, selectK can infer the number of patterns, which is based on two metrics that have been implemented in the NMF R package, including Cophenetic and Silhouette. Both metrics measure the stability for a particular number of patterns based on a hierarchical clustering of the consensus matrix. For a range of the number of patterns, a suitable number of patterns is the one at which Cophenetic and Silhouette values begin to drop suddenly (kinda like elbow plot).
+
+# Identify outgoing communication pattern of secreting cells
+# To intuitively show the associations of latent patterns with cell groups and LR pairs or signaling pathways, we used river (alluvial) plots. We first normalize each row of W and each column of H to be [0,1], and then set the elements in W and H to be zero if they are less than 0.5. This threshold uncovers the most enriched cell groups and signaling pathways associated with each inferred pattern. These thresholded matrices W and H are used as inputs for creating alluvial plots.
+
+# To directly relate cell groups with their enriched signaling pathways, we set the elements in W and H to be zero if they are less than 1/R where R is the number of latent patterns. Using a contribution score of each cell group to each signaling pathway computed by multiplying W by H, we constructed a dot plot in which the dot size is proportion to the contribution score to show association between cell group and their enriched signaling pathways. USERS can also decrease the parameter cutoff to show more enriched signaling pathways associated each cell group.
+
+library(NMF)
+library(ggalluvial)
+
+# Here we run selectK to infer the number of patterns.
+selectK(cellchat, pattern = "outgoing")
+# Both Cophenetic and Silhouette values begin to drop suddenly after the number of outgoing patterns is 6.
+nPatterns <- 6
+setwd(wd)
+tiff("CellChat_Outgoing_Patterns.tiff", width=1000, height=1000, res=120)
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "outgoing", k = nPatterns)
+dev.off()
+
+setwd(wd)
+tiff("CellChat_Outgoing_River.tiff", width=2000, height=1200, res=120)
+netAnalysis_river(cellchat, pattern = "outgoing") # River plot
+tiff("CellChat_Outgoing_Dot.tiff", width=2000, height=600, res=120)
+netAnalysis_dot(cellchat, pattern = "outgoing") # Dot plot
+dev.off()
+
+# Identify and visualize incoming communication pattern of target cells
+selectK(cellchat, pattern = "incoming")
+# Cophenetic values begin to drop when the number of incoming patterns is 5.
+nPatterns <- 5
+setwd(wd)
+tiff("CellChat_Incoming_Patterns.tiff", width=1000, height=1000, res=120)
+cellchat <- identifyCommunicationPatterns(cellchat, pattern = "incoming", k = nPatterns)
+dev.off()
+
+setwd(wd)
+tiff("CellChat_Incoming_River.tiff", width=2000, height=1200, res=120)
+netAnalysis_river(cellchat, pattern = "incoming") # River plot
+tiff("CellChat_Incoming_Dot.tiff", width=2000, height=600, res=120)
+netAnalysis_dot(cellchat, pattern = "incoming") # Dot plot
+dev.off()
+
+# Manifold and classification learning of signaling networks
+# Functional similarity: High degree of functional similarity can be interpreted as the two signaling pathways or two LR pairs exhibit similar or redundant roles. The functional similarity analysis requires the same cell population composition between two datasets.
+# Structural similarity: A structural similarity was used to compare their signaling network structure, without considering the similarity of senders and receivers.
+
+# Identify signaling groups based on their functional similarity
+cellchat <- computeNetSimilarity(cellchat, type = "functional")
+#pip install umap-learn --ignore-installed (run in terminal)
+cellchat <- netEmbedding(cellchat, type = "functional")
+cellchat <- netClustering(cellchat, type = "functional")
+# Visualization in 2D-space
+setwd(wd)
+tiff("CellChat_Functional.tiff", width=2000, height=2000, res=120)
+netVisual_embedding(cellchat, type = "functional", label.size = 3.5)
+dev.off()
+#netVisual_embeddingZoomIn(cellchat, type = "functional", nCol = 2)
+
+# Identify signaling groups based on structure similarity
+cellchat <- computeNetSimilarity(cellchat, type = "structural")
+cellchat <- netEmbedding(cellchat, type = "structural")
+cellchat <- netClustering(cellchat, type = "structural")
+# Visualization in 2D-space
+setwd(wd)
+tiff("CellChat_Structural.tiff", width=2000, height=2000, res=120)
+netVisual_embedding(cellchat, type = "structural", label.size = 3.5)
+dev.off()
+#netVisual_embeddingZoomIn(cellchat, type = "structural", nCol = 2)
+
+setwd(wd)
+saveRDS(cellchat, file = "cellchat_ctrl_MgEndo.rds")
+```
+
